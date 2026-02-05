@@ -1,0 +1,10 @@
+mcp[cli]
+py-clob-client
+python-dotenv
+pydantic
+requests
+web3
+fastapi
+uvicorn
+jinja2
+websockets
