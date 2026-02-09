@@ -21,6 +21,8 @@ class ConfigUpdate(BaseModel):
     target_wallet: str
     dry_run: bool
     poll_interval: int
+    size_mode: str
+    size_value: float
 
 @app.on_event("startup")
 async def startup_event():
@@ -34,6 +36,8 @@ async def read_root(request: Request):
         "target_wallet": trader.target_wallet,
         "dry_run": trader.dry_run,
         "poll_interval": trader.poll_interval,
+        "size_mode": trader.size_mode,
+        "size_value": trader.size_value,
         "running": trader.running
     })
 
@@ -54,7 +58,9 @@ async def update_config(config: ConfigUpdate):
     trader.update_config(
         target_wallet=config.target_wallet, 
         dry_run=config.dry_run, 
-        poll_interval=config.poll_interval
+        poll_interval=config.poll_interval,
+        size_mode=config.size_mode,
+        size_value=config.size_value
     )
     # Restart if running to apply new interval effectively in the loop
     if trader.running:

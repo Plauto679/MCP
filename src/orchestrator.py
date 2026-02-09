@@ -14,10 +14,12 @@ SERVER_SCRIPT = os.path.join(os.path.dirname(__file__), "server.py")
 PYTHON_EXE = sys.executable
 
 class CopyTrader:
-    def __init__(self, target_wallet: str, dry_run: bool = False, poll_interval: int = 10):
+    def __init__(self, target_wallet: str, dry_run: bool = False, poll_interval: int = 10, size_mode: str = 'fixed', size_value: float = 10.0):
         self.target_wallet = target_wallet
         self.dry_run = dry_run
         self.poll_interval = poll_interval
+        self.size_mode = size_mode  # 'fixed' or 'percentage'
+        self.size_value = size_value
         self.running = False
         self.app_state = {
             "positions": {}  # tokenId -> size
@@ -38,6 +40,7 @@ class CopyTrader:
         self.running = True
         self.log(f"Starting Copy Trader Service...")
         self.log(f"Target: {self.target_wallet} | Dry Run: {self.dry_run} | Interval: {self.poll_interval}s")
+        self.log(f"Strategy: {self.size_mode.upper()} | Value: {self.size_value}")
         self._task = asyncio.create_task(self._monitor_loop())
 
     async def stop(self):
@@ -92,14 +95,18 @@ class CopyTrader:
         except Exception as e:
             self.log(f"Error in tick: {e}")
 
-    def update_config(self, target_wallet: str = None, dry_run: bool = None, poll_interval: int = None):
+    def update_config(self, target_wallet: str = None, dry_run: bool = None, poll_interval: int = None, size_mode: str = None, size_value: float = None):
         if target_wallet is not None:
             self.target_wallet = target_wallet
         if dry_run is not None:
             self.dry_run = dry_run
         if poll_interval is not None:
             self.poll_interval = poll_interval
-        self.log(f"Config Updated: Target={self.target_wallet}, DryRun={self.dry_run}, Interval={self.poll_interval}")
+        if size_mode is not None:
+            self.size_mode = size_mode
+        if size_value is not None:
+            self.size_value = size_value
+        self.log(f"Config Updated: Target={self.target_wallet}, DryRun={self.dry_run}, Interval={self.poll_interval}, Mode={self.size_mode}, Value={self.size_value}")
 
 if __name__ == "__main__":
     # Legacy CLI entry point
