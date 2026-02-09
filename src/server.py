@@ -58,12 +58,13 @@ def get_wallet_positions(address: str):
     Useful for observing target wallets (Copy Trading).
     """
     import requests
+    import json
     # Use Data API for reading positions
     url = f"https://data-api.polymarket.com/positions?user={address}"
     try:
         resp = requests.get(url)
         resp.raise_for_status()
-        return resp.json()
+        return json.dumps(resp.json())
     except Exception as e:
         return f"Error fetching positions: {str(e)}"
 

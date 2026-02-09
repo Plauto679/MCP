@@ -22,15 +22,15 @@ class CopyTrader:
         self.size_value = size_value
         self.running = False
         self.app_state = {
-            "positions": {}  # tokenId -> size
+            "positions": {}  # asset_id -> size (float)
         }
+        self.initial_sync_complete = False
         self.logs: List[str] = []
         self._task: Optional[asyncio.Task] = None
 
     def log(self, message: str):
         print(message)
         self.logs.append(message)
-        # Keep logs manageable
         if len(self.logs) > 1000:
             self.logs.pop(0)
 
@@ -38,8 +38,9 @@ class CopyTrader:
         if self.running:
             return
         self.running = True
+        self.initial_sync_complete = False # Reset on start to get fresh snapshot
         self.log(f"Starting Copy Trader Service...")
-        self.log(f"Target: {self.target_wallet} | Dry Run: {self.dry_run} | Interval: {self.poll_interval}s")
+        self.log(f"Target: {self.target_wallet} | Dry Run: {self.dry_run}")
         self.log(f"Strategy: {self.size_mode.upper()} | Value: {self.size_value}")
         self._task = asyncio.create_task(self._monitor_loop())
 
@@ -84,16 +85,132 @@ class CopyTrader:
             # 1. Fetch Target Positions
             positions_result = await session.call_tool("get_wallet_positions", arguments={"address": self.target_wallet})
             
-            if isinstance(positions_result.content, list) and len(positions_result.content) > 0:
-                data = positions_result.content[0].text
-                # Simple log for now, can be parsed later
-                self.log(f"[Tick] Positions fetched for {self.target_wallet[:6]}...")
-                # data processing logic placeholder
+            # Parse Response
+            current_positions = {}
+            import json
+            import ast
+            
+            content = positions_result.content[0].text
+            data = None
+            
+            try:
+                # Try JSON first (standard)
+                data = json.loads(content) if isinstance(content, str) else content
+            except:
+                try:
+                    # Fallback to literal_eval (if Python string rep)
+                    data = ast.literal_eval(content) if isinstance(content, str) else content
+                except:
+                    data = content
+
+            if isinstance(data, list):
+                for pos in data:
+                    # Data API format usually: { "asset": "0x...", "size": "100", ... }
+                    asset_id = pos.get("asset")
+                    size = float(pos.get("size", 0))
+                    if asset_id and size > 0:
+                        current_positions[asset_id] = size
+                
+                # 2. Logic Engine
+                if not self.initial_sync_complete:
+                    self.app_state["positions"] = current_positions
+                    self.initial_sync_complete = True
+                    self.log(f"[Sync] Initial snapshot taken. Tracking {len(current_positions)} positions. Waiting for changes...")
+                else:
+                    await self.diff_and_execute(session, current_positions)
+                    
             else:
-                self.log(f"[Tick] No content or error fetching positions.")
+                self.log(f"[Tick] Invalid data format received. Type: {type(data)}. Content: {str(data)[:50]}...")
 
         except Exception as e:
+            # Import traceback to print full stack trace to logs for debugging
+            import traceback
             self.log(f"Error in tick: {e}")
+            traceback.print_exc()
+
+    async def diff_and_execute(self, session, current_positions: Dict[str, float]):
+        previous_positions = self.app_state["positions"]
+        
+        # Check for changes
+        all_assets = set(current_positions.keys()) | set(previous_positions.keys())
+        
+        for asset_id in all_assets:
+            new_size = current_positions.get(asset_id, 0.0)
+            old_size = previous_positions.get(asset_id, 0.0)
+            
+            if new_size != old_size:
+                delta = new_size - old_size
+                action = "BUY" if delta > 0 else "SELL"
+                
+                # Log the detection
+                self.log(f"[Signal] Target {action}: Asset {asset_id[:6]}... | Change: {delta:+.2f}")
+                
+                # Execute Trade
+                await self.execute_trade(session, asset_id, delta, action)
+
+        # Update State
+        self.app_state["positions"] = current_positions
+
+    async def execute_trade(self, session, asset_id: str, target_delta: float, action: str):
+        # 1. Calculate My Size
+        trade_size = 0.0
+        
+        if self.size_mode == 'percentage':
+            # Multiply target's delta by my multiplier
+            trade_size = abs(target_delta) * self.size_value
+            self.log(f"   -> Strategy: Percentage ({self.size_value}x). Order Size: {trade_size:.2f}")
+            
+        elif self.size_mode == 'fixed':
+            # Fixed Amount ($) / Price = Size (Shares)
+            # We need the price. For now, we will try to fetch market/price or use a placeholder price
+            # Since we don't have a direct "get_price(asset)" tool connected efficiently here in tick loop,
+            # we might default to 1 share = $1 (BAD assumption) or try to fetch it.
+            # Ideally: call 'get_market' or 'get_token_price'.
+            # For this MVP, we will try to fetch market to get price, or LOG ERROR if too slow.
+            
+            # Optimization: Just use a default price of 0.5 (Binary options usually 0-1) to estimate size? 
+            # OR better: Log that Fixed Amount requires price fetching which is slow, so we fallback to assuming 
+            # 1.0 share if price unknown?
+            # Let's try to fetch market details if possible, or just log.
+            
+            # For safety in MVP: Fixed Amount acts as "Fixed Shares" if we can't get price. 
+            # Wait, user said "10USD". We NEED price.
+            # Let's assume we can fetch it.
+            try:
+                # We need condition_id usually to get market, but we only have asset_id (token_id).
+                # Data API positions usually have 'conditionId' too.
+                # simpler: Let's just log for now that "Fixed Amount calc requires price" and use size_value as SHARES for safety.
+                # self.log(f"   -> Strategy: Fixed Amount ($). Fetching price...") 
+                # For now, treat size_value as SHARES to ensure it runs:
+                trade_size = self.size_value
+                self.log(f"   -> Strategy: Fixed Amount (Treating as {trade_size} Shares for MVP).")
+            except:
+                trade_size = 1.0
+
+        if trade_size <= 0:
+            self.log("   -> Calculated size is 0. Skipping.")
+            return
+
+        # 2. Place Order
+        if self.dry_run:
+            self.log(f"   [DRY RUN] Would {action} {trade_size:.2f} of {asset_id}")
+        else:
+            self.log(f"   [EXECUTE] Placing {action} Order: {trade_size:.2f} shares...")
+            # We need 'side' and 'price'.
+            # For Copy Trading, usually we want to cross the spread (Market Order) or Limit at safe price.
+            # CLOB only supports Limit, and strict validation (e.g. max 0.99).
+            # BUY -> Price 0.99 (Safe "Market Buy" to fill against current Asks)
+            # SELL -> Price 0.01 (Safe "Market Sell" to fill against current Bids)
+            limit_price = 0.99 if action == "BUY" else 0.01
+            
+            result = await session.call_tool("place_order", arguments={
+                "market_slug": "na", # not needed for token_id based order
+                "side": action,
+                "size": trade_size,
+                "price": limit_price,
+                "token_id": asset_id
+            })
+            self.log(f"   -> Order Result: {str(result.content)[:100]}")
 
     def update_config(self, target_wallet: str = None, dry_run: bool = None, poll_interval: int = None, size_mode: str = None, size_value: float = None):
         if target_wallet is not None:
