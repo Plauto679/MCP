@@ -92,7 +92,17 @@ def place_order(market_slug: str, side: str, size: float, price: float, token_id
             token_id=token_id
         )
         resp = client.create_order(order_args)
-        return resp
+        # The response is an Order object, we need to serialize it
+        import json
+        try:
+            # Try to get the ID and other details. usually resp['orderID'] or resp.id
+            # Start by returning a dict representation
+            if hasattr(resp, '__dict__'):
+                return json.dumps(resp.__dict__, default=str)
+            else:
+                return json.dumps({"orderID": str(resp)})
+        except:
+             return str(resp)
     except Exception as e:
         return f"Error placing order: {str(e)}"
 
