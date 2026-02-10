@@ -8,6 +8,22 @@
     },
     "history": [
         {
+            "timestamp": "2026-02-10T08:10:51.046503",
+            "target_wallet": "0xA24231941F243d8Edf6351eB8F4b2C4FdB2a5Cb5",
+            "dry_run": false,
+            "poll_interval": 30,
+            "size_mode": "percentage",
+            "size_value": 1.0
+        },
+        {
+            "timestamp": "2026-02-10T08:10:48.159208",
+            "target_wallet": "0xA24231941F243d8Edf6351eB8F4b2C4FdB2a5Cb5",
+            "dry_run": false,
+            "poll_interval": 30,
+            "size_mode": "percentage",
+            "size_value": 1.0
+        },
+        {
             "timestamp": "2026-02-10T08:00:56.901381",
             "target_wallet": "0xA24231941F243d8Edf6351eB8F4b2C4FdB2a5Cb5",
             "dry_run": false,

@@ -123,11 +123,16 @@ def place_order(market_slug: str, side: str, size: float, price: float, token_id
         )
         
         # Use FOK (Fill Or Kill) to ensure immediate execution (mimic Market Order behavior)
-        # or GTC with aggressive price. FOK is safer to avoid stuck orders if liquidity vanishes.
-        # Docs use create_and_post_order.
-        resp = client.create_and_post_order(
-            order_args,
-            order_type=OrderType.FOK 
+        # The create_and_post_order helper in this version doesn't support order_type arg.
+        # We must split it: create (sign) -> post
+        
+        # 1. Create and Sign
+        signed_order = client.create_order(order_args)
+        
+        # 2. Post with FOK
+        resp = client.post_order(
+            signed_order,
+            orderType=OrderType.FOK
         )
         
         # The response is an Order object/Dict, we need to serialize it

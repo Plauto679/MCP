@@ -22,20 +22,36 @@ def create_keys():
 
     print(f"Using Private Key: {key[:6]}...{key[-4:]}")
     
+    # 2. Get Proxy Address (Optional)
+    proxy_address = os.getenv("POLYMARKET_PROXY_ADDRESS")
+    
     try:
-        # 2. Initialize Client (Temporary connection to generate keys)
+        # 3. Initialize Client
         # We use the Polygon chain ID (137)
-        client = ClobClient(
-            host="https://clob.polymarket.com",
-            key=key, 
-            chain_id=137
-        )
+        if proxy_address:
+            print(f"Using Proxy Wallet: {proxy_address}")
+            client = ClobClient(
+                host="https://clob.polymarket.com",
+                key=key, 
+                chain_id=137,
+                signature_type=1,
+                funder=proxy_address
+            )
+        else:
+            print("Using EOA Wallet (No Proxy)")
+            client = ClobClient(
+                host="https://clob.polymarket.com",
+                key=key, 
+                chain_id=137,
+                signature_type=0
+            )
         
-        print("\nRequesting new API Credentials from Polymarket...")
-        # 3. Create API Key
-        resp = client.create_api_key()
+        print("\nRequesting API Credentials from Polymarket...")
+        # 4. Create or Derive API Key
+        # This will return existing keys if they exist, or create new ones
+        resp = client.create_or_derive_api_creds()
         
-        print("\nSUCCESS! Here are your new API Credentials:")
+        print("\nSUCCESS! Here are your API Credentials:")
         print("------------------------------------------------")
         print(f"POLYMARKET_API_KEY={resp.api_key}")
         print(f"POLYMARKET_API_SECRET={resp.secret}")
@@ -45,7 +61,7 @@ def create_keys():
         
     except Exception as e:
         print(f"\nError generating keys: {e}")
-        print("Ensure your private key is correct and has a small amount of MATIC for any potential signing requirements (though creating keys is usually off-chain signing).")
+        print("Ensure your private key is correct (and matches the Proxy owner if using a Proxy).")
 
 if __name__ == "__main__":
     create_keys()
