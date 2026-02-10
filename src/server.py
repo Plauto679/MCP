@@ -28,13 +28,33 @@ def get_client() -> ClobClient:
             api_passphrase=POLYMARKET_PASSPHRASE
         )
     
-    # We prefer using Creds + Key (for signing) if available
-    return ClobClient(
-        host=HOST,
-        key=PRIVATE_KEY,
-        creds=creds,
-        chain_id=CHAIN_ID
-    )
+    # Determine connection type
+    # 0 = EOA (Default), 1 = Poly Proxy (Magic/Google), 2 = Gnosis Safe
+    # If POLYMARKET_PROXY_ADDRESS is set, we assume type 1 (Poly Proxy) for now.
+    proxy_address = os.getenv("POLYMARKET_PROXY_ADDRESS")
+    
+    if proxy_address:
+        print(f"Using Proxy Wallet: {proxy_address} (Signature Type 1)")
+        return ClobClient(
+            host=HOST,
+            key=PRIVATE_KEY,
+            creds=creds,
+            chain_id=CHAIN_ID,
+            signature_type=1, # 1 = Polymarket Proxy
+            funder=proxy_address # Funder is the proxy address
+        )
+    else:
+        print("Using EOA Wallet (Signature Type 0)")
+        return ClobClient(
+            host=HOST,
+            key=PRIVATE_KEY,
+            creds=creds,
+            chain_id=CHAIN_ID,
+            signature_type=0, # 0 = EOA
+            funder=creds.api_key # Actually for EOA funder is just implied or we can explicitly pass the EOA address if needed, but py-clob-client handles basic EOA well. 
+            # Note: For EOA, 'funder' arg in ClobClient constructor might be optional or should be the EOA address. 
+            # Safest is to let default be standard EOA behavior or explicit.
+        )
 
 @mcp.tool()
 def get_market(condition_id: str):
@@ -85,25 +105,46 @@ def place_order(market_slug: str, side: str, size: float, price: float, token_id
         return "Error: API Keys not configured. Cannot place orders."
     
     try:
+        from py_clob_client.clob_types import OrderType
+        # Define constants if not imported
+        BUY = "BUY"
+        SELL = "SELL"
+        
+        # Validate Side
+        side_str = side.upper()
+        if side_str not in [BUY, SELL]:
+            return f"Error: Invalid side {side}. Must be BUY or SELL."
+
         order_args = OrderArgs(
             price=price,
             size=size,
-            side=side.upper(),
+            side=side_str,
             token_id=token_id
         )
-        resp = client.create_order(order_args)
-        # The response is an Order object, we need to serialize it
+        
+        # Use FOK (Fill Or Kill) to ensure immediate execution (mimic Market Order behavior)
+        # or GTC with aggressive price. FOK is safer to avoid stuck orders if liquidity vanishes.
+        # Docs use create_and_post_order.
+        resp = client.create_and_post_order(
+            order_args,
+            order_type=OrderType.FOK 
+        )
+        
+        # The response is an Order object/Dict, we need to serialize it
         import json
         try:
             # Try to get the ID and other details. usually resp['orderID'] or resp.id
-            # Start by returning a dict representation
-            if hasattr(resp, '__dict__'):
+            if isinstance(resp, dict):
+                return json.dumps(resp, default=str)
+            elif hasattr(resp, '__dict__'):
                 return json.dumps(resp.__dict__, default=str)
             else:
-                return json.dumps({"orderID": str(resp)})
+                return json.dumps({"orderID": str(resp), "raw": str(resp)})
         except:
              return str(resp)
     except Exception as e:
+        import traceback
+        traceback.print_exc()
         return f"Error placing order: {str(e)}"
 
 @mcp.tool()

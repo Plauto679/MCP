@@ -265,6 +265,24 @@ class CopyTrader:
         if size_value is not None:
             self.size_value = size_value
         self.log(f"Config Updated: Target={self.target_wallet}, DryRun={self.dry_run}, Interval={self.poll_interval}, Mode={self.size_mode}, Value={self.size_value}")
+        
+        # Save to history
+        from datetime import datetime
+        entry = {
+            "timestamp": datetime.now().isoformat(),
+            "target_wallet": self.target_wallet,
+            "dry_run": self.dry_run,
+            "poll_interval": self.poll_interval,
+            "size_mode": self.size_mode,
+            "size_value": self.size_value
+        }
+        # Prepend to history (newest first)
+        self.history.insert(0, entry)
+        # Keep history limited to last 50 entries
+        if len(self.history) > 50:
+            self.history = self.history[:50]
+            
+        self.save_state()
 
 if __name__ == "__main__":
     # Legacy CLI entry point
