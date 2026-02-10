@@ -27,6 +27,47 @@ class CopyTrader:
         self.initial_sync_complete = False
         self.logs: List[str] = []
         self._task: Optional[asyncio.Task] = None
+        
+        # Persistence
+        self.data_file = os.path.join(os.path.dirname(__file__), "..", "user_data.json")
+        self.history: List[Dict] = []
+        self.load_state()
+
+    def load_state(self):
+        import json
+        if os.path.exists(self.data_file):
+            try:
+                with open(self.data_file, 'r') as f:
+                    data = json.load(f)
+                    config = data.get('config', {})
+                    self.target_wallet = config.get('target_wallet', self.target_wallet)
+                    self.dry_run = config.get('dry_run', self.dry_run)
+                    self.poll_interval = config.get('poll_interval', self.poll_interval)
+                    self.size_mode = config.get('size_mode', self.size_mode)
+                    self.size_value = config.get('size_value', self.size_value)
+                    self.history = data.get('history', [])
+                    self.log(f"State loaded from {self.data_file}")
+            except Exception as e:
+                self.log(f"Error loading state: {e}")
+
+    def save_state(self):
+        import json
+        from datetime import datetime
+        data = {
+            "config": {
+                "target_wallet": self.target_wallet,
+                "dry_run": self.dry_run,
+                "poll_interval": self.poll_interval,
+                "size_mode": self.size_mode,
+                "size_value": self.size_value
+            },
+            "history": self.history
+        }
+        try:
+            with open(self.data_file, 'w') as f:
+                json.dump(data, f, indent=4)
+        except Exception as e:
+            self.log(f"Error saving state: {e}")
 
     def log(self, message: str):
         print(message)

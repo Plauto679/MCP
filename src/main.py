@@ -72,6 +72,10 @@ async def update_config(config: ConfigUpdate):
 async def get_logs():
     return {"logs": trader.logs[-50:]}
 
+@app.get("/api/history")
+async def get_history():
+    return {"history": trader.history}
+
 @app.websocket("/ws/logs")
 async def websocket_endpoint(websocket: WebSocket):
     await websocket.accept()
