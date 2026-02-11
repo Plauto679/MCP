@@ -54,8 +54,8 @@ def create_keys():
         print("\nSUCCESS! Here are your API Credentials:")
         print("------------------------------------------------")
         print(f"POLYMARKET_API_KEY={resp.api_key}")
-        print(f"POLYMARKET_API_SECRET={resp.secret}")
-        print(f"POLYMARKET_PASSPHRASE={resp.passphrase}")
+        print(f"POLYMARKET_API_SECRET={resp.api_secret}")
+        print(f"POLYMARKET_PASSPHRASE={resp.api_passphrase}")
         print("------------------------------------------------")
         print("\nPlease copy these values into your .env file.")
         

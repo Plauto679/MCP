@@ -45,15 +45,15 @@ def get_client() -> ClobClient:
         )
     else:
         print("Using EOA Wallet (Signature Type 0)")
+        # For EOA, the funder is derived from the private key automatically
+        # Do NOT pass creds.api_key as funder - that's a UUID, not an address!
         return ClobClient(
             host=HOST,
             key=PRIVATE_KEY,
             creds=creds,
             chain_id=CHAIN_ID,
-            signature_type=0, # 0 = EOA
-            funder=creds.api_key # Actually for EOA funder is just implied or we can explicitly pass the EOA address if needed, but py-clob-client handles basic EOA well. 
-            # Note: For EOA, 'funder' arg in ClobClient constructor might be optional or should be the EOA address. 
-            # Safest is to let default be standard EOA behavior or explicit.
+            signature_type=0  # 0 = EOA
+            # funder parameter omitted - will be auto-derived from private key
         )
 
 @mcp.tool()
@@ -115,24 +115,46 @@ def place_order(market_slug: str, side: str, size: float, price: float, token_id
         if side_str not in [BUY, SELL]:
             return f"Error: Invalid side {side}. Must be BUY or SELL."
 
+        # Round size to 2 decimal places (Polymarket requirement for maker amount)
+        rounded_size = round(float(size), 2)
+        
+        # Enforce Polymarket's minimum order value of $1
+        # For BUY orders: total value = size × price
+        # For SELL orders: total value = size × (1 - price)
+        min_order_value = 1.0
+        
+        if side_str == "BUY":
+            order_value = rounded_size * float(price)
+            if order_value < min_order_value:
+                # Adjust size upward to meet minimum
+                rounded_size = round(min_order_value / float(price), 2)
+                # Ensure we round UP to avoid still being under $1
+                if rounded_size * float(price) < min_order_value:
+                    rounded_size = round(rounded_size + 0.01, 2)
+        else:  # SELL
+            order_value = rounded_size * (1.0 - float(price))
+            if order_value < min_order_value:
+                rounded_size = round(min_order_value / (1.0 - float(price)), 2)
+                if rounded_size * (1.0 - float(price)) < min_order_value:
+                    rounded_size = round(rounded_size + 0.01, 2)
+        
         order_args = OrderArgs(
             price=price,
-            size=size,
+            size=rounded_size,
             side=side_str,
             token_id=token_id
         )
         
-        # Use FOK (Fill Or Kill) to ensure immediate execution (mimic Market Order behavior)
-        # The create_and_post_order helper in this version doesn't support order_type arg.
-        # We must split it: create (sign) -> post
+        # Use GTC (Good-Til-Canceled) as the standard order type
+        # This allows partial fills and better execution than FOK
         
         # 1. Create and Sign
         signed_order = client.create_order(order_args)
         
-        # 2. Post with FOK
+        # 2. Post with GTC (default, most reliable)
         resp = client.post_order(
             signed_order,
-            orderType=OrderType.FOK
+            orderType=OrderType.GTC
         )
         
         # The response is an Order object/Dict, we need to serialize it
@@ -150,7 +172,17 @@ def place_order(market_slug: str, side: str, size: float, price: float, token_id
     except Exception as e:
         import traceback
         traceback.print_exc()
-        return f"Error placing order: {str(e)}"
+        
+        # Check for specific Polymarket errors
+        error_msg = str(e)
+        if "does not exist" in error_msg:
+            return f"Error: Market/orderbook does not exist (likely closed or settled). Skipping this trade."
+        elif "not enough balance" in error_msg or "allowance" in error_msg:
+            return f"Error: Insufficient balance or allowance in Proxy Wallet. Please fund your account."
+        elif "Unauthorized" in error_msg or "Invalid api key" in error_msg:
+            return f"Error: API authentication failed. Please regenerate API keys."
+        else:
+            return f"Error placing order: {error_msg}"
 
 @mcp.tool()
 def cancel_all():
