@@ -34,13 +34,13 @@ def get_client() -> ClobClient:
     proxy_address = os.getenv("POLYMARKET_PROXY_ADDRESS")
     
     if proxy_address:
-        print(f"Using Proxy Wallet: {proxy_address} (Signature Type 1)")
+        print(f"Using Proxy Wallet: {proxy_address} (Signature Type 2 - Gnosis Safe)")
         return ClobClient(
             host=HOST,
             key=PRIVATE_KEY,
             creds=creds,
             chain_id=CHAIN_ID,
-            signature_type=1, # 1 = Polymarket Proxy
+            signature_type=2, # 2 = Gnosis Safe (most common for browser wallet connections)
             funder=proxy_address # Funder is the proxy address
         )
     else:

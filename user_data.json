@@ -1,12 +1,36 @@
 {
     "config": {
-        "target_wallet": "0xfcbecc7e5186e88e03445b81f593685d62828f44",
+        "target_wallet": "0x6031b6eed1c97e853c6e0f03ad3ce3529351f96d",
         "dry_run": false,
         "poll_interval": 30,
         "size_mode": "fixed",
-        "size_value": 2.0
+        "size_value": 1.0
     },
     "history": [
+        {
+            "timestamp": "2026-02-12T04:51:28.708184",
+            "target_wallet": "0x6031b6eed1c97e853c6e0f03ad3ce3529351f96d",
+            "dry_run": false,
+            "poll_interval": 30,
+            "size_mode": "fixed",
+            "size_value": 1.0
+        },
+        {
+            "timestamp": "2026-02-12T04:10:41.610145",
+            "target_wallet": "0xA24231941F243d8Edf6351eB8F4b2C4FdB2a5Cb5",
+            "dry_run": false,
+            "poll_interval": 30,
+            "size_mode": "percentage",
+            "size_value": 1.0
+        },
+        {
+            "timestamp": "2026-02-12T04:10:17.680443",
+            "target_wallet": "0xfcbecc7e5186e88e03445b81f593685d62828f44",
+            "dry_run": false,
+            "poll_interval": 30,
+            "size_mode": "percentage",
+            "size_value": 1.0
+        },
         {
             "timestamp": "2026-02-10T19:13:05.325431",
             "target_wallet": "0xfcbecc7e5186e88e03445b81f593685d62828f44",
