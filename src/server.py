@@ -3,6 +3,7 @@ from mcp.server.fastmcp import FastMCP
 from py_clob_client.client import ClobClient
 from py_clob_client.clob_types import ApiCreds, OrderArgs
 from dotenv import load_dotenv
+import sys
 
 # Load environment variables
 load_dotenv()
@@ -34,7 +35,8 @@ def get_client() -> ClobClient:
     proxy_address = os.getenv("POLYMARKET_PROXY_ADDRESS")
     
     if proxy_address:
-        print(f"Using Proxy Wallet: {proxy_address} (Signature Type 2 - Gnosis Safe)")
+        # Log to stderr to avoid breaking MCP JSON-RPC protocol
+        print(f"Using Proxy Wallet: {proxy_address} (Signature Type 2 - Gnosis Safe)", file=sys.stderr)
         return ClobClient(
             host=HOST,
             key=PRIVATE_KEY,
@@ -44,7 +46,8 @@ def get_client() -> ClobClient:
             funder=proxy_address # Funder is the proxy address
         )
     else:
-        print("Using EOA Wallet (Signature Type 0)")
+        # Log to stderr to avoid breaking MCP JSON-RPC protocol
+        print("Using EOA Wallet (Signature Type 0)", file=sys.stderr)
         # For EOA, the funder is derived from the private key automatically
         # Do NOT pass creds.api_key as funder - that's a UUID, not an address!
         return ClobClient(

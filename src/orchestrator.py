@@ -22,7 +22,9 @@ class CopyTrader:
         self.size_value = size_value
         self.running = False
         self.app_state = {
-            "positions": {}  # asset_id -> size (float)
+            "positions": {},  # asset_id -> size (float)
+            "prices": {},     # asset_id -> current price (float)
+            "multipliers": {} # asset_id -> ratio (my_shares / target_shares)
         }
         self.initial_sync_complete = False
         self.logs: List[str] = []
@@ -45,6 +47,7 @@ class CopyTrader:
                     self.poll_interval = config.get('poll_interval', self.poll_interval)
                     self.size_mode = config.get('size_mode', self.size_mode)
                     self.size_value = config.get('size_value', self.size_value)
+                    self.app_state["multipliers"] = data.get('multipliers', {})
                     self.history = data.get('history', [])
                     self.log(f"State loaded from {self.data_file}")
             except Exception as e:
@@ -61,6 +64,7 @@ class CopyTrader:
                 "size_mode": self.size_mode,
                 "size_value": self.size_value
             },
+            "multipliers": self.app_state["multipliers"],
             "history": self.history
         }
         try:
@@ -149,8 +153,10 @@ class CopyTrader:
                     # Data API format usually: { "asset": "0x...", "size": "100", ... }
                     asset_id = pos.get("asset")
                     size = float(pos.get("size", 0))
+                    price = float(pos.get("curPrice", 0.5)) # Fallback to 0.5 if unavailable
                     if asset_id and size > 0:
                         current_positions[asset_id] = size
+                        self.app_state["prices"][asset_id] = price
                 
                 # 2. Logic Engine
                 if not self.initial_sync_complete:
@@ -196,37 +202,40 @@ class CopyTrader:
         # 1. Calculate My Size
         trade_size = 0.0
         
+        # Get multiplier for this asset
+        multiplier = self.app_state["multipliers"].get(asset_id)
+        
         if self.size_mode == 'percentage':
-            # Multiply target's delta by my multiplier
-            trade_size = abs(target_delta) * self.size_value
+            # Percentage mode uses the fixed config value as a universal multiplier
+            multiplier = self.size_value
+            trade_size = abs(target_delta) * multiplier
             self.log(f"   -> Strategy: Percentage ({self.size_value}x). Order Size: {trade_size:.2f}")
             
         elif self.size_mode == 'fixed':
-            # Fixed Amount ($) / Price = Size (Shares)
-            # We need the price. For now, we will try to fetch market/price or use a placeholder price
-            # Since we don't have a direct "get_price(asset)" tool connected efficiently here in tick loop,
-            # we might default to 1 share = $1 (BAD assumption) or try to fetch it.
-            # Ideally: call 'get_market' or 'get_token_price'.
-            # For this MVP, we will try to fetch market to get price, or LOG ERROR if too slow.
+            # Fixed USD mode calculates a specific multiplier on the first trade
+            if multiplier is None:
+                if action == "SELL":
+                    self.log(f"   -> Strategy: Fixed. Got SELL signal for unknown asset {asset_id[:6]}. Cannot calculate size. Skipping.")
+                    return
+                
+                # First BUY: Calculate multiplier needed to reach size_value in USD
+                price = self.app_state["prices"].get(asset_id, 0.5)
+                # target_delta is how many shares they just bought
+                # we want to spend self.size_value USD
+                # my_size = self.size_value / price
+                # multiplier = my_size / target_delta
+                my_target_shares = self.size_value / price if price > 0 else 0
+                multiplier = my_target_shares / abs(target_delta) if target_delta != 0 else 0
+                
+                self.app_state["multipliers"][asset_id] = multiplier
+                self.save_state()
+                self.log(f"   -> Strategy: Fixed. Calculated multiplier {multiplier:.4f} (Price: ${price:.2f})")
             
-            # Optimization: Just use a default price of 0.5 (Binary options usually 0-1) to estimate size? 
-            # OR better: Log that Fixed Amount requires price fetching which is slow, so we fallback to assuming 
-            # 1.0 share if price unknown?
-            # Let's try to fetch market details if possible, or just log.
-            
-            # For safety in MVP: Fixed Amount acts as "Fixed Shares" if we can't get price. 
-            # Wait, user said "10USD". We NEED price.
-            # Let's assume we can fetch it.
-            try:
-                # We need condition_id usually to get market, but we only have asset_id (token_id).
-                # Data API positions usually have 'conditionId' too.
-                # simpler: Let's just log for now that "Fixed Amount calc requires price" and use size_value as SHARES for safety.
-                # self.log(f"   -> Strategy: Fixed Amount ($). Fetching price...") 
-                # For now, treat size_value as SHARES to ensure it runs:
-                trade_size = self.size_value
-                self.log(f"   -> Strategy: Fixed Amount (Treating as {trade_size} Shares for MVP).")
-            except:
-                trade_size = 1.0
+            trade_size = abs(target_delta) * multiplier
+            self.log(f"   -> Strategy: Fixed USD (${self.size_value}). Order Size: {trade_size:.2f} shares")
+
+        # Round trade size to 2 decimals for Polymarket
+        trade_size = round(trade_size, 2)
 
         if trade_size <= 0:
             self.log("   -> Calculated size is 0. Skipping.")
