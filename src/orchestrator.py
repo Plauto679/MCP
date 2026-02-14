@@ -1,6 +1,5 @@
-import asyncio
-import os
 import sys
+import math
 from typing import List, Dict, Optional
 from dotenv import load_dotenv
 
@@ -33,6 +32,16 @@ class CopyTrader:
         # Persistence
         self.data_file = os.path.join(os.path.dirname(__file__), "..", "user_data.json")
         self.history: List[Dict] = []
+        self.data_file = os.path.join(os.path.dirname(__file__), "..", "user_data.json")
+        self.history: List[Dict] = []
+        
+        # Identify My Wallet Address (for checking own positions)
+        self.my_address = os.getenv("POLYMARKET_PROXY_ADDRESS")
+        if not self.my_address:
+            # If no proxy, we might be EOA. For now, we assume Proxy as per recent config.
+            # If needed, we could derive EOA from PRIVATE_KEY using web3/eth_account
+            pass
+
         self.load_state()
 
     def load_state(self):
@@ -202,7 +211,7 @@ class CopyTrader:
         # 1. Calculate My Size
         trade_size = 0.0
         
-        # Get multiplier for this asset
+        # Get multiplier for this asset (used in Percentage mode, or legacy Fixed tracking)
         multiplier = self.app_state["multipliers"].get(asset_id)
         
         if self.size_mode == 'percentage':
@@ -212,30 +221,63 @@ class CopyTrader:
             self.log(f"   -> Strategy: Percentage ({self.size_value}x). Order Size: {trade_size:.2f}")
             
         elif self.size_mode == 'fixed':
-            # Fixed USD mode calculates a specific multiplier on the first trade
-            if multiplier is None:
-                if action == "SELL":
-                    self.log(f"   -> Strategy: Fixed. Got SELL signal for unknown asset {asset_id[:6]}. Cannot calculate size. Skipping.")
-                    return
-                
-                # First BUY: Calculate multiplier needed to reach size_value in USD
-                price = self.app_state["prices"].get(asset_id, 0.5)
-                # target_delta is how many shares they just bought
-                # we want to spend self.size_value USD
-                # my_size = self.size_value / price
-                # multiplier = my_size / target_delta
-                my_target_shares = self.size_value / price if price > 0 else 0
-                multiplier = my_target_shares / abs(target_delta) if target_delta != 0 else 0
-                
-                self.app_state["multipliers"][asset_id] = multiplier
-                self.save_state()
-                self.log(f"   -> Strategy: Fixed. Calculated multiplier {multiplier:.4f} (Price: ${price:.2f})")
+            # NEW LOGIC: Strict USD Amount for Buys, Sell Everything for Sells
             
-            trade_size = abs(target_delta) * multiplier
-            self.log(f"   -> Strategy: Fixed USD (${self.size_value}). Order Size: {trade_size:.2f} shares")
+            if action == "BUY":
+                # Always buy exactly 'size_value' USD worth
+                price = self.app_state["prices"].get(asset_id, 0.5) 
+                if price <= 0: price = 0.5 # Safety
+                
+                # Size (Shares) = USD / Price
+                trade_size = self.size_value / price
+                self.log(f"   -> Strategy: Fixed USD (${self.size_value}). Price: ${price:.2f} -> Size: {trade_size:.2f} shares")
+                
+            elif action == "SELL":
+                # Sell Everything: We need to know how much we hold
+                if not self.my_address:
+                    self.log("   -> Strategy: Fixed (Sell). Cannot sell all because 'my_address' is unknown.")
+                    return
+
+                try:
+                    # Fetch MY positions to find current holding
+                    my_pos_result = await session.call_tool("get_wallet_positions", arguments={"address": self.my_address})
+                    import json
+                    import ast
+                    content = my_pos_result.content[0].text
+                    # Parse...
+                    my_data = None
+                    try: my_data = json.loads(content) if isinstance(content, str) else content
+                    except: 
+                        try: my_data = ast.literal_eval(content) if isinstance(content, str) else content
+                        except: my_data = content
+                    
+                    my_holding = 0.0
+                    if isinstance(my_data, list):
+                        for pos in my_data:
+                            if pos.get("asset") == asset_id:
+                                my_holding = float(pos.get("size", 0))
+                                break
+                    
+                    if my_holding > 0:
+                        trade_size = my_holding
+                        # Floor to 2 decimals to avoid rounding up beyond actual balance
+                        # e.g. 11.956 -> 11.95 (Safe), not 11.96 (Error)
+                        trade_size = math.floor(trade_size * 100) / 100
+                        self.log(f"   -> Strategy: Fixed (Sell). Selling entire position: {trade_size:.2f} shares")
+                    else:
+                        self.log(f"   -> Strategy: Fixed (Sell). We hold 0 shares. Nothing to sell.")
+                        trade_size = 0.0
+                except Exception as e:
+                     self.log(f"   -> Strategy: Fixed (Sell). Error fetching my positions: {e}")
+                     trade_size = 0.0
 
         # Round trade size to 2 decimals for Polymarket
-        trade_size = round(trade_size, 2)
+        # For BUYs, standard round is fine. For SELLs, we already floored above.
+        if action == "BUY":
+            trade_size = round(trade_size, 2)
+        elif action == "SELL" and self.size_mode != 'fixed':
+             # Legacy percentage sell logic still needs rounding
+             trade_size = round(trade_size, 2)
 
         if trade_size <= 0:
             self.log("   -> Calculated size is 0. Skipping.")
