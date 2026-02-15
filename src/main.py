@@ -24,6 +24,9 @@ class ConfigUpdate(BaseModel):
     size_mode: str
     size_value: float
 
+class StartRequest(BaseModel):
+    duration: Optional[int] = None
+
 @app.on_event("startup")
 async def startup_event():
     # Start the trader automatically or wait for user? Let's wait for user start.
@@ -42,10 +45,13 @@ async def read_root(request: Request):
     })
 
 @app.post("/api/start")
-async def start_bot():
+async def start_bot(req: StartRequest = None):
+    # req might be None if called without body, handle gracefully
+    duration = req.duration if req else None
+    
     if not trader.running:
-        await trader.start()
-    return {"status": "started", "running": True}
+        await trader.start(duration_minutes=duration)
+    return {"status": "started", "running": True, "duration": duration}
 
 @app.post("/api/stop")
 async def stop_bot():

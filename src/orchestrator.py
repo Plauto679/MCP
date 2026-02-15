@@ -1,3 +1,5 @@
+import asyncio
+import os
 import sys
 import math
 from typing import List, Dict, Optional
@@ -34,6 +36,7 @@ class CopyTrader:
         self.history: List[Dict] = []
         self.data_file = os.path.join(os.path.dirname(__file__), "..", "user_data.json")
         self.history: List[Dict] = []
+        self.stop_time: Optional[float] = None # Timestamp when bot should stop automatically
         
         # Identify My Wallet Address (for checking own positions)
         self.my_address = os.getenv("POLYMARKET_PROXY_ADDRESS")
@@ -88,11 +91,20 @@ class CopyTrader:
         if len(self.logs) > 1000:
             self.logs.pop(0)
 
-    async def start(self):
+    async def start(self, duration_minutes: int = None):
         if self.running:
             return
         self.running = True
         self.initial_sync_complete = False # Reset on start to get fresh snapshot
+        
+        # Set stop time if duration provided
+        if duration_minutes and duration_minutes > 0:
+            import time
+            self.stop_time = time.time() + (duration_minutes * 60)
+            self.log(f"Timer set for {duration_minutes} minutes. Stopping at {time.ctime(self.stop_time)}")
+        else:
+            self.stop_time = None
+            
         self.log(f"Starting Copy Trader Service...")
         self.log(f"Target: {self.target_wallet} | Dry Run: {self.dry_run}")
         self.log(f"Strategy: {self.size_mode.upper()} | Value: {self.size_value}")
@@ -128,6 +140,14 @@ class CopyTrader:
                     self.log(f"Connected to MCP Server. Tools: {[t.name for t in tools.tools]}")
                     
                     while self.running:
+                        # Check timer
+                        if self.stop_time:
+                            import time
+                            if time.time() > self.stop_time:
+                                self.log("Timer expired. Stopping Copy Trader Service...")
+                                self.running = False
+                                break
+                        
                         await self.tick(session)
                         await asyncio.sleep(self.poll_interval)
         except Exception as e:

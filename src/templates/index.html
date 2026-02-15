@@ -110,7 +110,17 @@
                                 <label for="dry-run" class="ml-2 block text-sm text-gray-300">Dry Run Mode</label>
                             </div>
                         </div>
-                        <div class="flex space-x-3 pt-2">
+                        </div>
+                        
+                        <!-- Timer Settings -->
+                        <div class="mt-4 pt-4 border-t border-gray-700">
+                             <label class="block text-sm font-medium text-gray-400">Run Duration (Minutes)</label>
+                             <div class="text-xs text-gray-500 mb-1">Leave empty or 0 to run indefinitely</div>
+                             <input type="number" id="run-duration" placeholder="e.g. 60"
+                                    class="mt-1 block w-full bg-gray-700 border border-gray-600 rounded-md shadow-sm py-2 px-3 text-white focus:outline-none focus:ring-blue-500 focus:border-blue-500 font-mono text-sm">
+                        </div>
+
+                        <div class="flex space-x-3 pt-4">
                             <button onclick="saveConfig()"
                                 class="bg-blue-600 hover:bg-blue-700 text-white font-bold py-2 px-4 rounded transition w-full md:w-auto">
                                 Save & Update Config
@@ -222,7 +232,14 @@
         }
 
         async function startBot() {
-            const res = await fetch('/api/start', { method: 'POST' });
+            const durationInput = document.getElementById('run-duration').value;
+            const duration = durationInput ? parseInt(durationInput) : null;
+            
+            const res = await fetch('/api/start', { 
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ duration: duration }) 
+            });
             if (res.ok) updateUI(true);
         }
 
