@@ -15,16 +15,24 @@ SERVER_SCRIPT = os.path.join(os.path.dirname(__file__), "server.py")
 PYTHON_EXE = sys.executable
 
 class CopyTrader:
-    def __init__(self, target_wallet: str, dry_run: bool = False, poll_interval: int = 10, size_mode: str = 'fixed', size_value: float = 10.0):
-        self.target_wallet = target_wallet
+    def __init__(self, target_wallets: List[str] = None, dry_run: bool = False, poll_interval: int = 10, size_mode: str = 'fixed', size_value: float = 10.0, target_wallet: str = None):
+        # Backward compatibility for single wallet arg
+        if target_wallets is None:
+            if target_wallet:
+                self.target_wallets = [target_wallet]
+            else:
+                self.target_wallets = []
+        else:
+            self.target_wallets = target_wallets
+            
         self.dry_run = dry_run
         self.poll_interval = poll_interval
         self.size_mode = size_mode  # 'fixed' or 'percentage'
         self.size_value = size_value
         self.running = False
         self.app_state = {
-            "positions": {},  # asset_id -> size (float)
-            "prices": {},     # asset_id -> current price (float)
+            "positions": {},  # target_address -> { asset_id -> size }
+            "prices": {},     # asset_id -> current price (float) using global price cache
             "multipliers": {} # asset_id -> ratio (my_shares / target_shares)
         }
         self.initial_sync_complete = False
@@ -54,7 +62,11 @@ class CopyTrader:
                 with open(self.data_file, 'r') as f:
                     data = json.load(f)
                     config = data.get('config', {})
-                    self.target_wallet = config.get('target_wallet', self.target_wallet)
+                    # Load list of wallets if present, else fallback to single
+                    self.target_wallets = config.get('target_wallets', [])
+                    if not self.target_wallets and config.get('target_wallet'):
+                        self.target_wallets = [config.get('target_wallet')]
+                        
                     self.dry_run = config.get('dry_run', self.dry_run)
                     self.poll_interval = config.get('poll_interval', self.poll_interval)
                     self.size_mode = config.get('size_mode', self.size_mode)
@@ -70,7 +82,7 @@ class CopyTrader:
         from datetime import datetime
         data = {
             "config": {
-                "target_wallet": self.target_wallet,
+                "target_wallets": self.target_wallets,
                 "dry_run": self.dry_run,
                 "poll_interval": self.poll_interval,
                 "size_mode": self.size_mode,
@@ -106,7 +118,9 @@ class CopyTrader:
             self.stop_time = None
             
         self.log(f"Starting Copy Trader Service...")
-        self.log(f"Target: {self.target_wallet} | Dry Run: {self.dry_run}")
+        self.log(f"Targets: {len(self.target_wallets)} wallets | Dry Run: {self.dry_run}")
+        if self.target_wallets:
+             self.log(f" -> {', '.join(self.target_wallets)}")
         self.log(f"Strategy: {self.size_mode.upper()} | Value: {self.size_value}")
         self._task = asyncio.create_task(self._monitor_loop())
 
@@ -156,47 +170,61 @@ class CopyTrader:
 
     async def tick(self, session: ClientSession):
         try:
-            # 1. Fetch Target Positions
-            positions_result = await session.call_tool("get_wallet_positions", arguments={"address": self.target_wallet})
-            
-            # Parse Response
-            current_positions = {}
-            import json
-            import ast
-            
-            content = positions_result.content[0].text
-            data = None
-            
-            try:
-                # Try JSON first (standard)
-                data = json.loads(content) if isinstance(content, str) else content
-            except:
-                try:
-                    # Fallback to literal_eval (if Python string rep)
-                    data = ast.literal_eval(content) if isinstance(content, str) else content
-                except:
-                    data = content
-
-            if isinstance(data, list):
-                for pos in data:
-                    # Data API format usually: { "asset": "0x...", "size": "100", ... }
-                    asset_id = pos.get("asset")
-                    size = float(pos.get("size", 0))
-                    price = float(pos.get("curPrice", 0.5)) # Fallback to 0.5 if unavailable
-                    if asset_id and size > 0:
-                        current_positions[asset_id] = size
-                        self.app_state["prices"][asset_id] = price
+            # Iterate through ALL target wallets
+            for target_wallet in self.target_wallets:
+                # 1. Fetch Target Positions
+                positions_result = await session.call_tool("get_wallet_positions", arguments={"address": target_wallet})
                 
-                # 2. Logic Engine
-                if not self.initial_sync_complete:
-                    self.app_state["positions"] = current_positions
-                    self.initial_sync_complete = True
-                    self.log(f"[Sync] Initial snapshot taken. Tracking {len(current_positions)} positions. Waiting for changes...")
-                else:
-                    await self.diff_and_execute(session, current_positions)
+                # Parse Response
+                current_positions = {}
+                import json
+                import ast
+                
+                content = positions_result.content[0].text
+                data = None
+                
+                try:
+                    # Try JSON first (standard)
+                    data = json.loads(content) if isinstance(content, str) else content
+                except:
+                    try:
+                        # Fallback to literal_eval (if Python string rep)
+                        data = ast.literal_eval(content) if isinstance(content, str) else content
+                    except:
+                        data = content
+
+                if isinstance(data, list):
+                    for pos in data:
+                        # Data API format usually: { "asset": "0x...", "size": "100", ... }
+                        asset_id = pos.get("asset")
+                        size = float(pos.get("size", 0))
+                        price = float(pos.get("curPrice", 0.5)) # Fallback to 0.5 if unavailable
+                        if asset_id and size > 0:
+                            current_positions[asset_id] = size
+                            # Update global price cache
+                            self.app_state["prices"][asset_id] = price
                     
-            else:
-                self.log(f"[Tick] Invalid data format received. Type: {type(data)}. Content: {str(data)[:50]}...")
+                    # 2. Logic Engine (Per Wallet)
+                    # Initialize dict for this wallet if not exists
+                    if target_wallet not in self.app_state["positions"]:
+                         self.app_state["positions"][target_wallet] = {}
+
+                    if not self.initial_sync_complete:
+                        # We just store state on first run, effectively "syncing"
+                        self.app_state["positions"][target_wallet] = current_positions
+                        # We mark sync complete after first full loop? 
+                        # Actually we should track sync state PER wallet or just accept first run behavior.
+                        # For simplicity, let's keep one global flag but only set it True after loop finishes?
+                        # Or simpler: if 'positions' for this wallet was empty/missing, consider it a sync.
+                        self.log(f"[Sync] {target_wallet[:6]}... : Tracking {len(current_positions)} positions.")
+                    else:
+                        await self.diff_and_execute(session, target_wallet, current_positions)
+                        
+                else:
+                    self.log(f"[Tick] Invalid data format received for {target_wallet[:6]}...")
+            
+            # After processing all wallets
+            self.initial_sync_complete = True
 
         except Exception as e:
             # Import traceback to print full stack trace to logs for debugging
@@ -204,8 +232,8 @@ class CopyTrader:
             self.log(f"Error in tick: {e}")
             traceback.print_exc()
 
-    async def diff_and_execute(self, session, current_positions: Dict[str, float]):
-        previous_positions = self.app_state["positions"]
+    async def diff_and_execute(self, session, target_wallet: str, current_positions: Dict[str, float]):
+        previous_positions = self.app_state["positions"].get(target_wallet, {})
         
         # Check for changes
         all_assets = set(current_positions.keys()) | set(previous_positions.keys())
@@ -219,13 +247,13 @@ class CopyTrader:
                 action = "BUY" if delta > 0 else "SELL"
                 
                 # Log the detection
-                self.log(f"[Signal] Target {action}: Asset {asset_id[:6]}... | Change: {delta:+.2f}")
+                self.log(f"[Signal] {target_wallet[:6]}... {action}: Asset {asset_id[:6]}... | Change: {delta:+.2f}")
                 
                 # Execute Trade
                 await self.execute_trade(session, asset_id, delta, action)
 
-        # Update State
-        self.app_state["positions"] = current_positions
+        # Update State for this wallet
+        self.app_state["positions"][target_wallet] = current_positions
 
     async def execute_trade(self, session, asset_id: str, target_delta: float, action: str):
         # 1. Calculate My Size
@@ -324,9 +352,9 @@ class CopyTrader:
             })
             self.log(f"   -> Order Result: {str(result.content)[:100]}")
 
-    def update_config(self, target_wallet: str = None, dry_run: bool = None, poll_interval: int = None, size_mode: str = None, size_value: float = None):
-        if target_wallet is not None:
-            self.target_wallet = target_wallet
+    def update_config(self, target_wallets: List[str] = None, dry_run: bool = None, poll_interval: int = None, size_mode: str = None, size_value: float = None):
+        if target_wallets is not None:
+            self.target_wallets = target_wallets
         if dry_run is not None:
             self.dry_run = dry_run
         if poll_interval is not None:
@@ -335,13 +363,13 @@ class CopyTrader:
             self.size_mode = size_mode
         if size_value is not None:
             self.size_value = size_value
-        self.log(f"Config Updated: Target={self.target_wallet}, DryRun={self.dry_run}, Interval={self.poll_interval}, Mode={self.size_mode}, Value={self.size_value}")
+        self.log(f"Config Updated: Targets={len(self.target_wallets)}, DryRun={self.dry_run}, Interval={self.poll_interval}, Mode={self.size_mode}, Value={self.size_value}")
         
         # Save to history
         from datetime import datetime
         entry = {
             "timestamp": datetime.now().isoformat(),
-            "target_wallet": self.target_wallet,
+            "target_wallets": self.target_wallets,
             "dry_run": self.dry_run,
             "poll_interval": self.poll_interval,
             "size_mode": self.size_mode,

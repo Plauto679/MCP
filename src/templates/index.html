@@ -37,123 +37,119 @@
 </head>
 
 <body class="bg-gray-900 text-white min-h-screen p-8">
-    <div class="max-w-7xl mx-auto flex space-x-6">
+    <div class="max-w-screen-2xl mx-auto h-[calc(100vh-4rem)]">
+        <div class="flex h-full space-x-4">
 
-        <!-- Sidebar: Strategy History -->
-        <div class="w-1/4 bg-gray-800 p-4 rounded-lg border border-gray-700 h-[calc(100vh-4rem)] flex flex-col">
-            <h2 class="text-lg font-bold mb-4 text-gray-300 border-b border-gray-700 pb-2">📜 Strategy History</h2>
-            <div id="history-list" class="flex-1 overflow-y-auto space-y-3 pr-2 custom-scrollbar">
-                <div class="text-gray-500 text-sm italic text-center mt-10">No history yet...</div>
-            </div>
-            <div class="mt-4 pt-4 border-t border-gray-700">
-                <button onclick="loadHistory()"
-                    class="text-xs text-blue-400 hover:text-blue-300 w-full text-center">Refresh History</button>
-            </div>
-        </div>
-
-        <!-- Main Content -->
-        <div class="w-3/4 space-y-6 overflow-y-auto h-[calc(100vh-4rem)] pr-2 custom-scrollbar">
-            <!-- Header -->
-            <div class="flex justify-between items-center">
-                <h1 class="text-3xl font-bold text-blue-400">Polymarket Copy Trader</h1>
-                <div id="status-indicator" class="flex items-center space-x-2">
-                    <span class="w-3 h-3 rounded-full bg-red-500" id="status-dot"></span>
-                    <span id="status-text" class="font-semibold text-red-500">STOPPED</span>
+            <!-- COLUMN 1: History (20%) -->
+            <div class="w-1/5 bg-gray-800 p-4 rounded-lg border border-gray-700 flex flex-col h-full">
+                <h2 class="text-lg font-bold mb-4 text-gray-300 border-b border-gray-700 pb-2">📜 History</h2>
+                <div id="history-list" class="flex-1 overflow-y-auto space-y-3 pr-2 custom-scrollbar">
+                    <div class="text-gray-500 text-sm italic text-center mt-10">No history yet...</div>
                 </div>
+                <button onclick="loadHistory()"
+                    class="mt-2 text-xs text-blue-400 hover:text-blue-300 w-full text-center">Refresh</button>
             </div>
 
-            <!-- Controls & Stats -->
-            <div class="grid grid-cols-1 gap-6">
-                <!-- Configuration Card -->
-                <div class="bg-gray-800 p-6 rounded-lg border border-gray-700">
-                    <h2 class="text-xl font-semibold mb-4 text-gray-300">Configuration</h2>
+            <!-- COLUMN 2: Configuration (30%) -->
+            <div
+                class="w-3/10 bg-gray-800 p-6 rounded-lg border border-gray-700 h-full overflow-y-auto custom-scrollbar">
+                <h1 class="text-2xl font-bold text-blue-400 mb-6 border-b border-gray-700 pb-4">Configuration</h1>
+
+                <!-- Targets -->
+                <div class="mb-6">
+                    <label class="block text-sm font-medium text-gray-400 mb-2">Target Wallets</label>
+                    <div id="wallet-list" class="space-y-2">
+                        <!-- Wallet inputs injected here -->
+                    </div>
+                    <button onclick="addWalletInput()"
+                        class="mt-2 text-sm text-green-400 hover:text-green-300 font-mono flex items-center">
+                        <span class="text-xl mr-1">+</span> Add Target Wallet
+                    </button>
+                </div>
+
+                <!-- Strategy -->
+                <div class="bg-gray-750 p-4 rounded border border-gray-600 mb-6">
+                    <h3 class="text-sm font-medium text-gray-300 mb-2">Bet Size Strategy</h3>
                     <div class="space-y-4">
                         <div>
-                            <label class="block text-sm font-medium text-gray-400">Target Wallet Address</label>
-                            <input type="text" id="target-wallet" value="{{ target_wallet }}"
-                                class="mt-1 block w-full bg-gray-700 border border-gray-600 rounded-md shadow-sm py-2 px-3 text-white focus:outline-none focus:ring-blue-500 focus:border-blue-500 font-mono text-sm">
+                            <label class="block text-xs text-gray-500 uppercase">Mode</label>
+                            <select id="size-mode" onchange="updateSizeLabel()"
+                                class="mt-1 block w-full bg-gray-700 border border-gray-600 rounded-md shadow-sm py-2 px-3 text-white focus:outline-none focus:ring-blue-500">
+                                <option value="fixed" {% if size_mode=='fixed' %}selected{% endif %}>Fixed Amount
+                                </option>
+                                <option value="percentage" {% if size_mode=='percentage' %}selected{% endif %}>
+                                    Percentage Multiplier</option>
+                            </select>
                         </div>
-
-                        <!-- Bet Size Strategy -->
-                        <div class="bg-gray-750 p-4 rounded border border-gray-600">
-                            <h3 class="text-sm font-medium text-gray-300 mb-2">Bet Size Strategy</h3>
-                            <div class="grid grid-cols-2 gap-4">
-                                <div>
-                                    <label class="block text-xs text-gray-500 uppercase">Strategy Mode</label>
-                                    <select id="size-mode" onchange="updateSizeLabel()"
-                                        class="mt-1 block w-full bg-gray-700 border border-gray-600 rounded-md shadow-sm py-2 px-3 text-white focus:outline-none focus:ring-blue-500">
-                                        <option value="fixed" {% if size_mode=='fixed' %}selected{% endif %}>Fixed
-                                            Amount
-                                        </option>
-                                        <option value="percentage" {% if size_mode=='percentage' %}selected{% endif %}>
-                                            Percentage Multiplier</option>
-                                    </select>
-                                </div>
-                                <div>
-                                    <label id="size-value-label" class="block text-xs text-gray-500 uppercase">Amount
-                                        (USDC)</label>
-                                    <input type="number" step="0.01" id="size-value" value="{{ size_value }}"
-                                        class="mt-1 block w-full bg-gray-700 border border-gray-600 rounded-md shadow-sm py-2 px-3 text-white focus:outline-none focus:ring-blue-500">
-                                </div>
-                            </div>
-                        </div>
-
-                        <div class="grid grid-cols-2 gap-4">
-                            <div>
-                                <label class="block text-sm font-medium text-gray-400">Poll Interval (seconds)</label>
-                                <input type="number" id="poll-interval" value="{{ poll_interval }}"
-                                    class="mt-1 block w-full bg-gray-700 border border-gray-600 rounded-md shadow-sm py-2 px-3 text-white focus:outline-none focus:ring-blue-500 focus:border-blue-500">
-                            </div>
-                            <div class="flex items-center pt-6">
-                                <input type="checkbox" id="dry-run" {% if dry_run %}checked{% endif %}
-                                    class="h-4 w-4 text-blue-600 focus:ring-blue-500 border-gray-600 rounded bg-gray-700">
-                                <label for="dry-run" class="ml-2 block text-sm text-gray-300">Dry Run Mode</label>
-                            </div>
-                        </div>
-                        </div>
-                        
-                        <!-- Timer Settings -->
-                        <div class="mt-4 pt-4 border-t border-gray-700">
-                             <label class="block text-sm font-medium text-gray-400">Run Duration (Minutes)</label>
-                             <div class="text-xs text-gray-500 mb-1">Leave empty or 0 to run indefinitely</div>
-                             <input type="number" id="run-duration" placeholder="e.g. 60"
-                                    class="mt-1 block w-full bg-gray-700 border border-gray-600 rounded-md shadow-sm py-2 px-3 text-white focus:outline-none focus:ring-blue-500 focus:border-blue-500 font-mono text-sm">
-                        </div>
-
-                        <div class="flex space-x-3 pt-4">
-                            <button onclick="saveConfig()"
-                                class="bg-blue-600 hover:bg-blue-700 text-white font-bold py-2 px-4 rounded transition w-full md:w-auto">
-                                Save & Update Config
-                            </button>
+                        <div>
+                            <label id="size-value-label" class="block text-xs text-gray-500 uppercase">Amount
+                                (USDC)</label>
+                            <input type="number" step="0.01" id="size-value" value="{{ size_value }}"
+                                class="mt-1 block w-full bg-gray-700 border border-gray-600 rounded-md shadow-sm py-2 px-3 text-white focus:outline-none focus:ring-blue-500">
                         </div>
                     </div>
                 </div>
 
-                <!-- Actions Card -->
-                <div
-                    class="bg-gray-800 p-6 rounded-lg border border-gray-700 flex flex-col justify-center items-center space-y-4">
-                    <button onclick="startBot()" id="btn-start"
-                        class="w-full bg-green-600 hover:bg-green-700 text-white font-bold py-3 px-6 rounded-lg transition text-lg shadow-lg">
-                        START BOT
+                <!-- Settings -->
+                <div class="grid grid-cols-2 gap-4 mb-6">
+                    <div>
+                        <label class="block text-sm font-medium text-gray-400">Poll Interval (s)</label>
+                        <input type="number" id="poll-interval" value="{{ poll_interval }}"
+                            class="mt-1 block w-full bg-gray-700 border border-gray-600 rounded-md shadow-sm py-2 px-3 text-white">
+                    </div>
+                    <div class="flex items-center pt-6">
+                        <input type="checkbox" id="dry-run" {% if dry_run %}checked{% endif %}
+                            class="h-4 w-4 text-blue-600 border-gray-600 rounded bg-gray-700">
+                        <label for="dry-run" class="ml-2 block text-sm text-gray-300">Dry Run</label>
+                    </div>
+                </div>
+
+                <!-- Timer -->
+                <div class="mb-6 border-t border-gray-700 pt-4">
+                    <label class="block text-sm font-medium text-gray-400">Run Duration (Mins)</label>
+                    <input type="number" id="run-duration" placeholder="0 = Indefinite"
+                        class="mt-1 block w-full bg-gray-700 border border-gray-600 rounded-md shadow-sm py-2 px-3 text-white">
+                </div>
+
+                <!-- Action Buttons -->
+                <div class="space-y-3">
+                    <button onclick="saveConfig()"
+                        class="w-full bg-blue-600 hover:bg-blue-700 text-white font-bold py-2 px-4 rounded transition">
+                        Save Config
                     </button>
-                    <button onclick="stopBot()" id="btn-stop"
-                        class="w-full bg-red-600 hover:bg-red-700 text-white font-bold py-3 px-6 rounded-lg transition text-lg shadow-lg hidden">
-                        STOP BOT
-                    </button>
+
+                    <div id="status-indicator" class="flex justify-center items-center space-x-2 py-2">
+                        <span class="w-3 h-3 rounded-full bg-red-500" id="status-dot"></span>
+                        <span id="status-text" class="font-semibold text-red-500">STOPPED</span>
+                    </div>
+
+                    <div class="flex space-x-2">
+                        <button onclick="startBot()" id="btn-start"
+                            class="flex-1 bg-green-600 hover:bg-green-700 text-white font-bold py-3 px-4 rounded transition">
+                            START
+                        </button>
+                        <button onclick="stopBot()" id="btn-stop"
+                            class="flex-1 bg-red-600 hover:bg-red-700 text-white font-bold py-3 px-4 rounded transition hidden">
+                            STOP
+                        </button>
+                    </div>
                 </div>
             </div>
 
-            <!-- Terminal -->
-            <div>
-                <h2 class="text-xl font-semibold mb-2 text-gray-300 flex justify-between">
-                    <span>Live Logs</span>
-                    <span class="text-xs text-gray-500 font-mono self-end">Connected via WebSocket</span>
-                </h2>
-                <div id="terminal" class="terminal font-mono text-sm h-64">
+            <!-- COLUMN 3: Live Logs (50%) -->
+            <div class="w-1/2 bg-gray-900 rounded-lg border border-gray-700 flex flex-col h-full">
+                <div class="bg-gray-800 p-3 rounded-t-lg border-b border-gray-700 flex justify-between items-center">
+                    <h2 class="font-mono font-bold text-gray-300">>_ Terminal Output</h2>
+                    <span class="text-xs text-green-500 font-mono">● Live</span>
+                </div>
+                <div id="terminal"
+                    class="terminal font-mono text-sm flex-1 bg-[#1a1b26] p-4 overflow-y-auto rounded-b-lg">
                     <div class="log-entry text-gray-500">Waiting for logs...</div>
                 </div>
             </div>
+
         </div>
+    </div>
     </div>
 
     <script>
@@ -161,6 +157,29 @@
         const terminal = document.getElementById('terminal');
         let isRunning = {{ 'true' if running else 'false' }};
         let historyData = [];
+        // Parse python list of wallets to JS array
+        let currentWallets = {{ target_wallets | tojson }};
+
+        // Initialize UI
+        function initWallets() {
+            const list = document.getElementById('wallet-list');
+            list.innerHTML = '';
+            if (currentWallets.length === 0) currentWallets = [""];
+
+            currentWallets.forEach(addr => addWalletInput(addr));
+        }
+
+        function addWalletInput(value = "") {
+            const list = document.getElementById('wallet-list');
+            const div = document.createElement('div');
+            div.className = "flex space-x-2";
+            div.innerHTML = `
+                <input type="text" value="${value}" placeholder="0x..."
+                    class="wallet-input flex-1 block w-full bg-gray-700 border border-gray-600 rounded-md shadow-sm py-2 px-3 text-white font-mono text-sm">
+                <button onclick="this.parentElement.remove()" class="text-red-500 hover:text-red-400 font-bold px-2">X</button>
+            `;
+            list.appendChild(div);
+        }
 
         function updateUI(running) {
             isRunning = running;
@@ -188,6 +207,7 @@
         updateUI(isRunning);
         updateSizeLabel(); // Set correct label on load
         loadHistory(); // Load history on start
+        initWallets();
 
         function updateSizeLabel() {
             const mode = document.getElementById('size-mode').value;
@@ -208,8 +228,12 @@
         };
 
         async function saveConfig() {
+            // Collect all wallet inputs
+            const walletInputs = document.querySelectorAll('.wallet-input');
+            const wallets = Array.from(walletInputs).map(i => i.value).filter(v => v.trim() !== "");
+
             const config = {
-                target_wallet: document.getElementById('target-wallet').value,
+                target_wallets: wallets,
                 dry_run: document.getElementById('dry-run').checked,
                 poll_interval: parseInt(document.getElementById('poll-interval').value),
                 size_mode: document.getElementById('size-mode').value,
@@ -234,11 +258,11 @@
         async function startBot() {
             const durationInput = document.getElementById('run-duration').value;
             const duration = durationInput ? parseInt(durationInput) : null;
-            
-            const res = await fetch('/api/start', { 
+
+            const res = await fetch('/api/start', {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ duration: duration }) 
+                body: JSON.stringify({ duration: duration })
             });
             if (res.ok) updateUI(true);
         }
@@ -262,7 +286,7 @@
         function renderHistory() {
             const container = document.getElementById('history-list');
             container.innerHTML = '';
-            
+
             if (historyData.length === 0) {
                 container.innerHTML = '<div class="text-gray-500 text-sm italic text-center mt-10">No history yet...</div>';
                 return;
@@ -272,14 +296,15 @@
                 const date = new Date(item.timestamp).toLocaleString(undefined, {
                     month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit'
                 });
-                
+
                 const div = document.createElement('div');
                 div.className = "bg-gray-750 p-3 rounded cursor-pointer hover:bg-gray-700 border border-gray-600 transition group";
                 div.onclick = () => restoreConfig(index);
-                
-                // Truncate wallet for display
-                const walletShort = item.target_wallet.substring(0, 6) + '...' + item.target_wallet.substring(item.target_wallet.length - 4);
-                
+
+                // Truncate wallet for display (show first wallet count)
+                const walletCount = item.target_wallets ? item.target_wallets.length : (item.target_wallet ? 1 : 0);
+                const walletShort = walletCount > 1 ? `${walletCount} Wallets` : (item.target_wallets?.[0] || item.target_wallet || "Unknown").substring(0, 6) + '...';
+
                 div.innerHTML = `
                     <div class="flex justify-between items-start mb-1">
                         <span class="text-xs text-blue-400 font-mono font-bold">${walletShort}</span>
@@ -297,15 +322,18 @@
         function restoreConfig(index) {
             const item = historyData[index];
             if (!item) return;
-            
-            if(!confirm("Restore this configuration?")) return;
 
-            document.getElementById('target-wallet').value = item.target_wallet;
+            if (!confirm("Restore this configuration?")) return;
+
+            document.getElementById('wallet-list').innerHTML = ''; // Clear existing
+            const wallets = item.target_wallets || [item.target_wallet];
+            wallets.forEach(w => addWalletInput(w));
+
             document.getElementById('dry-run').checked = item.dry_run;
             document.getElementById('poll-interval').value = item.poll_interval;
             document.getElementById('size-mode').value = item.size_mode;
             document.getElementById('size-value').value = item.size_value;
-            
+
             updateSizeLabel();
             // Optional: Auto-save on restore? Or let user click save? 
             // Let's auto-save to apply it to the backend immediately.

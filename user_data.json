@@ -1,6 +1,8 @@
 {
     "config": {
-        "target_wallet": "0x63ce342161250d705dc0b16df89036c8e5f9ba9a",
+        "target_wallets": [
+            "0x63ce342161250d705dc0b16df89036c8e5f9ba9a"
+        ],
         "dry_run": false,
         "poll_interval": 5,
         "size_mode": "fixed",
@@ -350,6 +352,55 @@
         "62148103172278121318870040437314168028976124001641811834160187168408530537157": 0.008323510134760043
     },
     "history": [
+        {
+            "timestamp": "2026-02-15T02:23:59.998260",
+            "target_wallets": [
+                "0x63ce342161250d705dc0b16df89036c8e5f9ba9a"
+            ],
+            "dry_run": false,
+            "poll_interval": 5,
+            "size_mode": "fixed",
+            "size_value": 1.0
+        },
+        {
+            "timestamp": "2026-02-15T02:22:32.913359",
+            "target_wallets": [
+                "0x63ce342161250d705dc0b16df89036c8e5f9ba9a"
+            ],
+            "dry_run": false,
+            "poll_interval": 5,
+            "size_mode": "fixed",
+            "size_value": 1.0
+        },
+        {
+            "timestamp": "2026-02-15T02:04:29.504983",
+            "target_wallets": [
+                "0x63ce342161250d705dc0b16df89036c8e5f9ba9a",
+                "0x6031b6eed1c97e853c6e0f03ad3ce3529351f96d"
+            ],
+            "dry_run": false,
+            "poll_interval": 5,
+            "size_mode": "fixed",
+            "size_value": 1.0
+        },
+        {
+            "timestamp": "2026-02-15T02:02:40.976678",
+            "target_wallets": [
+                "0x63ce342161250d705dc0b16df89036c8e5f9ba9a"
+            ],
+            "dry_run": false,
+            "poll_interval": 5,
+            "size_mode": "fixed",
+            "size_value": 1.0
+        },
+        {
+            "timestamp": "2026-02-15T01:49:02.186201",
+            "target_wallet": "0x63ce342161250d705dc0b16df89036c8e5f9ba9a",
+            "dry_run": false,
+            "poll_interval": 5,
+            "size_mode": "fixed",
+            "size_value": 1.0
+        },
         {
             "timestamp": "2026-02-15T01:29:55.305721",
             "target_wallet": "0x63ce342161250d705dc0b16df89036c8e5f9ba9a",
