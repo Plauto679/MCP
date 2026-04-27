@@ -1,12 +1,14 @@
 {
     "config": {
-        "target_wallets": [
-            "0x63ce342161250d705dc0b16df89036c8e5f9ba9a"
-        ],
+        "target_wallets": [],
         "dry_run": false,
-        "poll_interval": 5,
+        "poll_interval": 20,
         "size_mode": "fixed",
-        "size_value": 1.0
+        "size_value": 1.0,
+        "winning_strategy_enabled": true,
+        "winning_price_threshold": 0.75,
+        "winning_entry_time": 3.0,
+        "winning_exit_time": 4.5
     },
     "multipliers": {
         "83985625121767749128525425797386357573094053182579412083702702865672457919148": 0.1141552511415525,
@@ -353,6 +355,130 @@
     },
     "history": [
         {
+            "timestamp": "2026-04-26T18:41:43.134214",
+            "target_wallets": [],
+            "dry_run": false,
+            "poll_interval": 20,
+            "size_mode": "fixed",
+            "size_value": 1.0,
+            "winning_strategy_enabled": true,
+            "winning_price_threshold": 0.75,
+            "strategy_mode": "martingale",
+            "martingale_initial_amount": 1.0
+        },
+        {
+            "timestamp": "2026-04-26T18:35:27.968675",
+            "target_wallets": [],
+            "dry_run": false,
+            "poll_interval": 20,
+            "size_mode": "fixed",
+            "size_value": 1.0,
+            "winning_strategy_enabled": true,
+            "winning_price_threshold": 0.75,
+            "strategy_mode": "martingale",
+            "martingale_initial_amount": 0.5
+        },
+        {
+            "timestamp": "2026-02-17T08:47:35.687084",
+            "target_wallets": [],
+            "dry_run": false,
+            "poll_interval": 3,
+            "size_mode": "fixed",
+            "size_value": 1.0,
+            "winning_strategy_enabled": true,
+            "winning_price_threshold": 0.75
+        },
+        {
+            "timestamp": "2026-02-16T19:29:06.835881",
+            "target_wallets": [
+                "0x63ce342161250d705dc0b16df89036c8e5f9ba9a"
+            ],
+            "dry_run": false,
+            "poll_interval": 3,
+            "size_mode": "fixed",
+            "size_value": 1.0
+        },
+        {
+            "timestamp": "2026-02-16T17:14:33.268978",
+            "target_wallets": [
+                "0x63ce342161250d705dc0b16df89036c8e5f9ba9a"
+            ],
+            "dry_run": false,
+            "poll_interval": 3,
+            "size_mode": "fixed",
+            "size_value": 1.0
+        },
+        {
+            "timestamp": "2026-02-15T11:40:49.390769",
+            "target_wallets": [
+                "0x63ce342161250d705dc0b16df89036c8e5f9ba9a"
+            ],
+            "dry_run": false,
+            "poll_interval": 7,
+            "size_mode": "percentage",
+            "size_value": 0.01
+        },
+        {
+            "timestamp": "2026-02-15T08:57:29.377676",
+            "target_wallets": [
+                "0x63ce342161250d705dc0b16df89036c8e5f9ba9a"
+            ],
+            "dry_run": false,
+            "poll_interval": 7,
+            "size_mode": "fixed",
+            "size_value": 0.03
+        },
+        {
+            "timestamp": "2026-02-15T08:18:15.697254",
+            "target_wallets": [
+                "0x63ce342161250d705dc0b16df89036c8e5f9ba9a"
+            ],
+            "dry_run": false,
+            "poll_interval": 7,
+            "size_mode": "fixed",
+            "size_value": 1.0
+        },
+        {
+            "timestamp": "2026-02-15T08:16:58.656102",
+            "target_wallets": [
+                "0x63ce342161250d705dc0b16df89036c8e5f9ba9a"
+            ],
+            "dry_run": false,
+            "poll_interval": 7,
+            "size_mode": "fixed",
+            "size_value": 1.0
+        },
+        {
+            "timestamp": "2026-02-15T08:16:21.643848",
+            "target_wallets": [
+                "0x63ce342161250d705dc0b16df89036c8e5f9ba9a"
+            ],
+            "dry_run": false,
+            "poll_interval": 7,
+            "size_mode": "fixed",
+            "size_value": 1.0
+        },
+        {
+            "timestamp": "2026-02-15T08:01:05.217578",
+            "target_wallets": [
+                "0x63ce342161250d705dc0b16df89036c8e5f9ba9a"
+            ],
+            "dry_run": false,
+            "poll_interval": 7,
+            "size_mode": "percentage",
+            "size_value": 0.1
+        },
+        {
+            "timestamp": "2026-02-15T07:56:10.554825",
+            "target_wallets": [
+                "0x63ce342161250d705dc0b16df89036c8e5f9ba9a"
+            ],
+            "dry_run": false,
+            "poll_interval": 7,
+            "size_mode": "fixed",
+            "size_value": 1.0
+        },
+        {
             "timestamp": "2026-02-15T02:23:59.998260",
             "target_wallets": [
                 "0x63ce342161250d705dc0b16df89036c8e5f9ba9a"
@@ -664,78 +790,6 @@
             "poll_interval": 30,
             "size_mode": "percentage",
             "size_value": 1.0
-        },
-        {
-            "timestamp": "2026-02-10T10:00:54.577775",
-            "target_wallet": "0xA24231941F243d8Edf6351eB8F4b2C4FdB2a5Cb5",
-            "dry_run": false,
-            "poll_interval": 30,
-            "size_mode": "fixed",
-            "size_value": 1.0
-        },
-        {
-            "timestamp": "2026-02-10T09:50:08.808535",
-            "target_wallet": "0xA24231941F243d8Edf6351eB8F4b2C4FdB2a5Cb5",
-            "dry_run": false,
-            "poll_interval": 30,
-            "size_mode": "percentage",
-            "size_value": 1.0
-        },
-        {
-            "timestamp": "2026-02-10T09:47:23.467142",
-            "target_wallet": "0xA24231941F243d8Edf6351eB8F4b2C4FdB2a5Cb5",
-            "dry_run": false,
-            "poll_interval": 30,
-            "size_mode": "percentage",
-            "size_value": 1.0
-        },
-        {
-            "timestamp": "2026-02-10T08:10:51.046503",
-            "target_wallet": "0xA24231941F243d8Edf6351eB8F4b2C4FdB2a5Cb5",
-            "dry_run": false,
-            "poll_interval": 30,
-            "size_mode": "percentage",
-            "size_value": 1.0
-        },
-        {
-            "timestamp": "2026-02-10T08:10:48.159208",
-            "target_wallet": "0xA24231941F243d8Edf6351eB8F4b2C4FdB2a5Cb5",
-            "dry_run": false,
-            "poll_interval": 30,
-            "size_mode": "percentage",
-            "size_value": 1.0
-        },
-        {
-            "timestamp": "2026-02-10T08:00:56.901381",
-            "target_wallet": "0xA24231941F243d8Edf6351eB8F4b2C4FdB2a5Cb5",
-            "dry_run": false,
-            "poll_interval": 30,
-            "size_mode": "percentage",
-            "size_value": 1.0
-        },
-        {
-            "timestamp": "2026-02-10T07:59:00.629107",
-            "target_wallet": "0xA24231941F243d8Edf6351eB8F4b2C4FdB2a5Cb5",
-            "dry_run": true,
-            "poll_interval": 30,
-            "size_mode": "percentage",
-            "size_value": 1.0
-        },
-        {
-            "timestamp": "2026-02-10T07:55:55.891048",
-            "target_wallet": "0xTEST_NO_RELOAD",
-            "dry_run": true,
-            "poll_interval": 10,
-            "size_mode": "fixed",
-            "size_value": 11.0
-        },
-        {
-            "timestamp": "2026-02-10T07:54:22.855359",
-            "target_wallet": "0xTEST_HISTORY_SUCCESS",
-            "dry_run": true,
-            "poll_interval": 10,
-            "size_mode": "fixed",
-            "size_value": 77.0
         }
     ]
 }

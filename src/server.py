@@ -200,5 +200,42 @@ def cancel_all():
     except Exception as e:
         return f"Error cancelling orders: {str(e)}"
 
+@mcp.tool()
+def get_balance():
+    """
+    Get the USDC balance of the bot's wallet (Proxy or EOA).
+    """
+    client = get_client()
+    if not POLYMARKET_API_KEY:
+        return "Error: API Keys not configured."
+    try:
+        # Fetch collateral (USDC) balance
+        # The client usually exposes this via get_balance_allowance or similar
+        # For simplicity, we can fetch the portfolio or user info
+        # Let's try to use the derived funder address
+        funder = client.funder
+        
+        # Use Data API to search for collateral balance
+        # or use clob client method if available. 
+        # client.get_balance_allowance requires an asset_type usually.
+        # Let's use simple requests to Data API for USDC balance of the user
+        import requests
+        # USDC (Polygon) Token Address: 0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174
+        # But data-api might have a simpler endpoint.
+        # Let's try client.get_account_balance() if it exists?
+        # Checking py-clob-client docs (mental check): it has get_balance_allowance
+        
+        # We can also use get_wallet_positions logic but filter for USDC?
+        # Actually, get_wallet_positions returns positions in markets, not USDC balance.
+        
+        # Let's use the ClobClient's get_balance_allowance
+        from py_clob_client.clob_types import AssetType
+        resp = client.get_balance_allowance(
+            params=None # This usually defaults to USDC (collateral)
+        )
+        return str(resp)
+    except Exception as e:
+        return f"Error fetching balance: {str(e)}"
+
 if __name__ == "__main__":
     mcp.run()

@@ -55,42 +55,145 @@
                 class="w-3/10 bg-gray-800 p-6 rounded-lg border border-gray-700 h-full overflow-y-auto custom-scrollbar">
                 <h1 class="text-2xl font-bold text-blue-400 mb-6 border-b border-gray-700 pb-4">Configuration</h1>
 
-                <!-- Targets -->
+                <!-- Strategy Selector -->
                 <div class="mb-6">
-                    <label class="block text-sm font-medium text-gray-400 mb-2">Target Wallets</label>
-                    <div id="wallet-list" class="space-y-2">
-                        <!-- Wallet inputs injected here -->
+                    <label class="block text-sm font-medium text-gray-400 mb-2">Strategy Mode</label>
+                    <div class="flex space-x-2 bg-gray-700 p-1 rounded-lg">
+                        <button id="btn-mode-copy" onclick="setStrategyMode('copy')"
+                            class="flex-1 py-1 px-3 rounded-md text-sm font-bold bg-blue-600 text-white shadow-sm transition-all duration-200">Copy
+                            Trading</button>
+                        <button id="btn-mode-winning" onclick="setStrategyMode('winning')"
+                            class="flex-1 py-1 px-3 rounded-md text-sm font-bold text-gray-400 hover:text-white hover:bg-gray-600 transition-all duration-200">Winning
+                            .75</button>
+                        <button id="btn-mode-martingale" onclick="setStrategyMode('martingale')"
+                            class="flex-1 py-1 px-3 rounded-md text-sm font-bold text-gray-400 hover:text-white hover:bg-gray-600 transition-all duration-200">Martingale</button>
                     </div>
-                    <button onclick="addWalletInput()"
-                        class="mt-2 text-sm text-green-400 hover:text-green-300 font-mono flex items-center">
-                        <span class="text-xl mr-1">+</span> Add Target Wallet
-                    </button>
+                    <input type="hidden" id="strategy-mode" value="{{ strategy_mode }}">
                 </div>
 
-                <!-- Strategy -->
-                <div class="bg-gray-750 p-4 rounded border border-gray-600 mb-6">
-                    <h3 class="text-sm font-medium text-gray-300 mb-2">Bet Size Strategy</h3>
-                    <div class="space-y-4">
-                        <div>
-                            <label class="block text-xs text-gray-500 uppercase">Mode</label>
-                            <select id="size-mode" onchange="updateSizeLabel()"
-                                class="mt-1 block w-full bg-gray-700 border border-gray-600 rounded-md shadow-sm py-2 px-3 text-white focus:outline-none focus:ring-blue-500">
-                                <option value="fixed" {% if size_mode=='fixed' %}selected{% endif %}>Fixed Amount
-                                </option>
-                                <option value="percentage" {% if size_mode=='percentage' %}selected{% endif %}>
-                                    Percentage Multiplier</option>
-                            </select>
+                <!-- === SECTION: COPY TRADING === -->
+                <div id="section-copy">
+                    <!-- Targets -->
+                    <div class="mb-6">
+                        <label class="block text-sm font-medium text-gray-400 mb-2">Target Wallets</label>
+                        <div id="wallet-list" class="space-y-2">
+                            <!-- Wallet inputs injected here -->
                         </div>
-                        <div>
-                            <label id="size-value-label" class="block text-xs text-gray-500 uppercase">Amount
-                                (USDC)</label>
-                            <input type="number" step="0.01" id="size-value" value="{{ size_value }}"
-                                class="mt-1 block w-full bg-gray-700 border border-gray-600 rounded-md shadow-sm py-2 px-3 text-white focus:outline-none focus:ring-blue-500">
+                        <button onclick="addWalletInput()"
+                            class="mt-2 text-sm text-green-400 hover:text-green-300 font-mono flex items-center">
+                            <span class="text-xl mr-1">+</span> Add Target Wallet
+                        </button>
+                    </div>
+
+                    <!-- Strategy -->
+                    <div class="bg-gray-750 p-4 rounded border border-gray-600 mb-6">
+                        <h3 class="text-sm font-medium text-gray-300 mb-2">Copy Sizing Strategy</h3>
+                        <div class="space-y-4">
+                            <div>
+                                <label class="block text-xs text-gray-500 uppercase">Mode</label>
+                                <select id="size-mode" onchange="updateSizeLabel()"
+                                    class="mt-1 block w-full bg-gray-700 border border-gray-600 rounded-md shadow-sm py-2 px-3 text-white focus:outline-none focus:ring-blue-500">
+                                    <option value="fixed" {% if size_mode=='fixed' %}selected{% endif %}>Fixed Amount
+                                    </option>
+                                    <option value="percentage" {% if size_mode=='percentage' %}selected{% endif %}>
+                                        Percentage Multiplier</option>
+                                </select>
+                            </div>
+                            <div>
+                                <label id="size-value-label" class="block text-xs text-gray-500 uppercase">Amount
+                                    (USDC)</label>
+                                <input type="number" step="0.01" id="size-value" value="{{ size_value }}"
+                                    class="mt-1 block w-full bg-gray-700 border border-gray-600 rounded-md shadow-sm py-2 px-3 text-white focus:outline-none focus:ring-blue-500">
+                            </div>
                         </div>
                     </div>
                 </div>
 
-                <!-- Settings -->
+                <!-- === SECTION: WINNING STRATEGY === -->
+                <div id="section-winning" class="hidden">
+                    <div class="bg-gray-750 p-4 rounded border border-gray-600 mb-6">
+                        <div class="flex items-center justify-between mb-4 border-b border-gray-600 pb-2">
+                            <h3 class="text-sm font-medium text-gray-300">Winning .75 Logic</h3>
+
+                            <!-- Toggle (Enabled/Disabled) -->
+                            <div class="flex items-center">
+                                <label for="winning-strategy-enabled" class="text-xs text-gray-400 mr-2">Enabled</label>
+                                <input type="checkbox" id="winning-strategy-enabled" {% if winning_strategy_enabled
+                                    %}checked{% endif %}
+                                    class="h-4 w-4 text-green-600 border-gray-600 rounded bg-gray-700">
+                            </div>
+                        </div>
+
+                        <!-- Sizing for Winning Strategy -->
+                        <div class="mb-4 space-y-3 border-b border-gray-600 pb-4">
+                            <h4 class="text-xs font-bold text-blue-400 uppercase">Input Sizing</h4>
+                            <div>
+                                <label class="block text-xs text-gray-500 uppercase mb-1">Mode</label>
+                                <select id="winning-size-mode" onchange="updateWinningSizeLabel()"
+                                    class="block w-full bg-gray-700 border border-gray-600 rounded-md shadow-sm py-1 px-2 text-white text-sm">
+                                    <option value="fixed" {% if winning_size_mode=='fixed' %}selected{% endif %}>Fixed
+                                        Amount ($)</option>
+                                    <option value="percent" {% if winning_size_mode=='percent' %}selected{% endif %}>%
+                                        of Available Balance</option>
+                                </select>
+                            </div>
+                            <div>
+                                <label id="winning-size-label" class="block text-xs text-gray-500 uppercase mb-1">Value
+                                    ($)</label>
+                                <input type="number" step="0.01" id="winning-size-value"
+                                    value="{{ winning_size_value }}"
+                                    class="block w-full bg-gray-700 border border-gray-600 rounded-md shadow-sm py-1 px-2 text-white text-sm">
+                            </div>
+                        </div>
+
+                        <div class="space-y-3">
+                            <div>
+                                <label class="block text-xs text-gray-500 uppercase">Min Price Threshold ($)</label>
+                                <input type="number" step="0.01" id="winning-price"
+                                    value="{{ winning_price_threshold }}"
+                                    class="mt-1 block w-full bg-gray-700 border border-gray-600 rounded-md shadow-sm py-2 px-3 text-white">
+                            </div>
+                            <div class="grid grid-cols-2 gap-4">
+                                <div>
+                                    <label class="block text-xs text-gray-500 uppercase">Entry Time (Min)</label>
+                                    <input type="number" step="0.1" id="winning-entry" value="{{ winning_entry_time }}"
+                                        class="mt-1 block w-full bg-gray-700 border border-gray-600 rounded-md shadow-sm py-2 px-3 text-white">
+                                </div>
+                                <div>
+                                    <label class="block text-xs text-gray-500 uppercase">Exit Time (Min)</label>
+                                    <input type="number" step="0.1" id="winning-exit" value="{{ winning_exit_time }}"
+                                        class="mt-1 block w-full bg-gray-700 border border-gray-600 rounded-md shadow-sm py-2 px-3 text-white">
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- === SECTION: MARTINGALE STRATEGY === -->
+                <div id="section-martingale" class="hidden">
+                    <div class="bg-gray-750 p-4 rounded border border-gray-600 mb-6">
+                        <div class="flex items-center justify-between mb-4 border-b border-gray-600 pb-2">
+                            <h3 class="text-sm font-medium text-gray-300">Martingale Logic</h3>
+                        </div>
+
+                        <div class="space-y-3">
+                            <div class="text-xs text-gray-400 mb-3">
+                                Enters a random token (UP/DOWN) at 00:05 of a new 5-minute market window.<br />
+                                Closes the position at 04:35.<br />
+                                If it loses, it doubles the bet amount and bets the SAME direction next window.
+                            </div>
+                            <div>
+                                <label class="block text-xs text-gray-500 uppercase">Initial Amount ($)</label>
+                                <input type="number" step="0.01" id="martingale-initial-amount"
+                                    value="{{ martingale_initial_amount }}"
+                                    class="mt-1 block w-full bg-gray-700 border border-gray-600 rounded-md shadow-sm py-2 px-3 text-white">
+                            </div>
+                            <!-- Streak status display could go here eventually -->
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Common Settings -->
                 <div class="grid grid-cols-2 gap-4 mb-6">
                     <div>
                         <label class="block text-sm font-medium text-gray-400">Poll Interval (s)</label>
@@ -203,11 +306,56 @@
             }
         }
 
+        function setStrategyMode(mode) {
+            document.getElementById('strategy-mode').value = mode;
+
+            // Toggle Buttons
+            const btnCopy = document.getElementById('btn-mode-copy');
+            const btnWin = document.getElementById('btn-mode-winning');
+            const btnMartingale = document.getElementById('btn-mode-martingale');
+
+            // Reset all to unselected
+            const unselectedClass = "flex-1 py-1 px-3 rounded-md text-sm font-bold text-gray-400 hover:text-white hover:bg-gray-600 transition-all duration-200";
+            btnCopy.className = unselectedClass;
+            btnWin.className = unselectedClass;
+            btnMartingale.className = unselectedClass;
+
+            document.getElementById('section-copy').classList.add('hidden');
+            document.getElementById('section-winning').classList.add('hidden');
+            document.getElementById('section-martingale').classList.add('hidden');
+
+            if (mode === 'winning') {
+                btnWin.className = "flex-1 py-1 px-3 rounded-md text-sm font-bold bg-green-600 text-white shadow-sm transition-all duration-200";
+                document.getElementById('section-winning').classList.remove('hidden');
+            } else if (mode === 'martingale') {
+                btnMartingale.className = "flex-1 py-1 px-3 rounded-md text-sm font-bold bg-purple-600 text-white shadow-sm transition-all duration-200";
+                document.getElementById('section-martingale').classList.remove('hidden');
+            } else { // default to copy
+                btnCopy.className = "flex-1 py-1 px-3 rounded-md text-sm font-bold bg-blue-600 text-white shadow-sm transition-all duration-200";
+                document.getElementById('section-copy').classList.remove('hidden');
+            }
+        }
+
+        function updateWinningSizeLabel() {
+            const mode = document.getElementById('winning-size-mode').value;
+            const label = document.getElementById('winning-size-label');
+            if (mode === 'fixed') {
+                label.innerText = 'Value ($)';
+            } else {
+                label.innerText = 'Percent (%)';
+            }
+        }
+
         // Initialize UI status
         updateUI(isRunning);
         updateSizeLabel(); // Set correct label on load
+        updateWinningSizeLabel();
         loadHistory(); // Load history on start
         initWallets();
+
+        // Init Strategy Mode
+        const initialMode = document.getElementById('strategy-mode').value || 'copy';
+        setStrategyMode(initialMode);
 
         function updateSizeLabel() {
             const mode = document.getElementById('size-mode').value;
@@ -237,7 +385,15 @@
                 dry_run: document.getElementById('dry-run').checked,
                 poll_interval: parseInt(document.getElementById('poll-interval').value),
                 size_mode: document.getElementById('size-mode').value,
-                size_value: parseFloat(document.getElementById('size-value').value)
+                size_value: parseFloat(document.getElementById('size-value').value),
+                winning_strategy_enabled: document.getElementById('winning-strategy-enabled').checked,
+                winning_price_threshold: parseFloat(document.getElementById('winning-price').value),
+                winning_entry_time: parseFloat(document.getElementById('winning-entry').value),
+                winning_exit_time: parseFloat(document.getElementById('winning-exit').value),
+                strategy_mode: document.getElementById('strategy-mode').value,
+                winning_size_mode: document.getElementById('winning-size-mode').value,
+                winning_size_value: parseFloat(document.getElementById('winning-size-value').value),
+                martingale_initial_amount: parseFloat(document.getElementById('martingale-initial-amount').value)
             };
 
             try {
@@ -301,18 +457,38 @@
                 div.className = "bg-gray-750 p-3 rounded cursor-pointer hover:bg-gray-700 border border-gray-600 transition group";
                 div.onclick = () => restoreConfig(index);
 
-                // Truncate wallet for display (show first wallet count)
-                const walletCount = item.target_wallets ? item.target_wallets.length : (item.target_wallet ? 1 : 0);
-                const walletShort = walletCount > 1 ? `${walletCount} Wallets` : (item.target_wallets?.[0] || item.target_wallet || "Unknown").substring(0, 6) + '...';
+                // Determine logic mode label
+                let modeLabel = 'COPY';
+                let modeColor = 'text-blue-400';
+
+                if (item.strategy_mode === 'winning') {
+                    modeLabel = 'WIN75';
+                    modeColor = 'text-green-400';
+                } else if (item.strategy_mode === 'martingale') {
+                    modeLabel = 'MARTINGALE';
+                    modeColor = 'text-purple-400';
+                }
+
+                // Truncate wallet for display (show first wallet count) or Strategy info
+                let subTitle = "";
+                if (item.strategy_mode === 'winning') {
+                    subTitle = `Entry: ${item.winning_entry_time}m`;
+                } else if (item.strategy_mode === 'martingale') {
+                    subTitle = `Initial: $${item.martingale_initial_amount}`;
+                } else {
+                    const walletCount = item.target_wallets ? item.target_wallets.length : (item.target_wallet ? 1 : 0);
+                    subTitle = walletCount > 1 ? `${walletCount} Wallets` : (item.target_wallets?.[0] || item.target_wallet || "Unknown").substring(0, 6) + '...';
+                }
 
                 div.innerHTML = `
                     <div class="flex justify-between items-start mb-1">
-                        <span class="text-xs text-blue-400 font-mono font-bold">${walletShort}</span>
+                        <span class="text-xs ${modeColor} font-mono font-bold">${modeLabel}</span>
                         <span class="text-[10px] text-gray-500">${date}</span>
                     </div>
+                     <div class="text-xs text-gray-400 mb-1">${subTitle}</div>
                     <div class="text-xs text-gray-300">
                         <span class="font-semibold text-gray-400">${item.size_mode === 'fixed' ? 'Fix' : 'Pct'}:</span> 
-                        ${item.size_value} ${item.size_mode === 'fixed' ? '$' : 'x'}
+                        ${item.size_value}
                     </div>
                 `;
                 container.appendChild(div);
@@ -325,16 +501,38 @@
 
             if (!confirm("Restore this configuration?")) return;
 
-            document.getElementById('wallet-list').innerHTML = ''; // Clear existing
-            const wallets = item.target_wallets || [item.target_wallet];
-            wallets.forEach(w => addWalletInput(w));
-
+            // Common Restores
             document.getElementById('dry-run').checked = item.dry_run;
             document.getElementById('poll-interval').value = item.poll_interval;
-            document.getElementById('size-mode').value = item.size_mode;
-            document.getElementById('size-value').value = item.size_value;
 
-            updateSizeLabel();
+            // Mode Restore
+            const mode = item.strategy_mode || 'copy';
+            setStrategyMode(mode);
+
+            if (mode === 'copy') {
+                document.getElementById('wallet-list').innerHTML = ''; // Clear existing
+                const wallets = item.target_wallets || [item.target_wallet];
+                wallets.forEach(w => addWalletInput(w));
+                document.getElementById('size-mode').value = item.size_mode;
+                document.getElementById('size-value').value = item.size_value;
+                updateSizeLabel();
+            } else if (mode === 'winning') {
+                // Restore Winning Strategy details
+                if (item.winning_strategy_enabled !== undefined) {
+                    document.getElementById('winning-strategy-enabled').checked = item.winning_strategy_enabled;
+                }
+                document.getElementById('winning-price').value = item.winning_price_threshold;
+                document.getElementById('winning-entry').value = item.winning_entry_time;
+                document.getElementById('winning-exit').value = item.winning_exit_time;
+                document.getElementById('winning-size-mode').value = item.winning_size_mode || 'fixed';
+                document.getElementById('winning-size-value').value = item.winning_size_value || 10.0;
+                updateWinningSizeLabel();
+            } else if (mode === 'martingale') {
+                if (item.martingale_initial_amount !== undefined) {
+                    document.getElementById('martingale-initial-amount').value = item.martingale_initial_amount;
+                }
+            }
+
             // Optional: Auto-save on restore? Or let user click save? 
             // Let's auto-save to apply it to the backend immediately.
             saveConfig();

@@ -2,9 +2,9 @@ mcp[cli]
 py-clob-client
 python-dotenv
 pydantic
-requests
-web3
-fastapi
-uvicorn
-jinja2
+aiofiles
+eth-account
 websockets
+aiohttp
+pandas
+openpyxl
