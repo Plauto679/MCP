@@ -116,6 +116,9 @@ async def websocket_endpoint(websocket: WebSocket):
         while True:
             # Check for new logs
             current_len = len(trader.logs)
+            if current_len < last_index:
+                # Log buffer was truncated; resync index so stream continues.
+                last_index = current_len
             if current_len > last_index:
                 new_logs = trader.logs[last_index:]
                 for log in new_logs:

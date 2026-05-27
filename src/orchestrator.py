@@ -3,6 +3,7 @@ import os
 import sys
 import math
 from typing import List, Dict, Optional
+from zoneinfo import ZoneInfo
 from dotenv import load_dotenv
 
 # We need to run the server as a subprocess for MCP connection
@@ -42,10 +43,17 @@ class CopyTrader:
         self.app_state = {
             "positions": {},  # target_address -> { asset_id -> size }
             "prices": {},     # asset_id -> current price (float) using global price cache
-            "multipliers": {} # asset_id -> ratio (my_shares / target_shares)
+            "multipliers": {}, # asset_id -> ratio (my_shares / target_shares)
+            "pending_settlements": []
         }
         self.initial_sync_complete = False
         self.logs: List[str] = []
+        self._active_events_failures = 0
+        self._last_active_events_warn_ts: Optional[float] = None
+        self._last_heartbeat_ts: Optional[float] = None
+        self._last_reconcile_ts: Optional[float] = None
+        self._last_excel_lock_warn_ts: Optional[float] = None
+        self.debug_logs = os.getenv("DEBUG_LOGS", "false").lower() == "true"
         self._task: Optional[asyncio.Task] = None
         
         # Persistence
@@ -63,6 +71,131 @@ class CopyTrader:
             pass
 
         self.load_state()
+
+    def _usd_to_shares(self, usd_amount: float, price: float) -> float:
+        """
+        Convert target USD notional into shares at a given price.
+        Keeps 2 decimals to match order sizing constraints in server.
+        """
+        p = max(float(price), 0.01)
+        shares = round(float(usd_amount) / p, 2)
+        if shares <= 0:
+            shares = 0.01
+        return shares
+
+    def _append_trade_to_excel(self, row: Dict):
+        import os
+        import pandas as pd
+
+        excel_path = os.path.join(os.path.dirname(__file__), "..", "historical_performance.xlsx")
+        new_row = pd.DataFrame([row])
+        if os.path.exists(excel_path):
+            df = pd.read_excel(excel_path)
+            df = pd.concat([df, new_row], ignore_index=True)
+        else:
+            df = new_row
+        df.to_excel(excel_path, index=False)
+
+    def _update_trade_row_in_excel(self, settlement_key: str, updates: Dict):
+        import os
+        import pandas as pd
+
+        excel_path = os.path.join(os.path.dirname(__file__), "..", "historical_performance.xlsx")
+        if not os.path.exists(excel_path):
+            return False
+        df = pd.read_excel(excel_path)
+        if "Settlement Key" not in df.columns:
+            return False
+        mask = df["Settlement Key"].astype(str) == str(settlement_key)
+        if not mask.any():
+            return False
+        idx = df[mask].index[-1]
+        for k, v in updates.items():
+            if k not in df.columns:
+                df[k] = None
+            df.at[idx, k] = v
+        df.to_excel(excel_path, index=False)
+        return True
+
+    def _record_martingale_trade_row(
+        self,
+        state: Dict,
+        slug: str,
+        start_time,
+        exit_price: float,
+        is_win: Optional[bool],
+        close_status: str = "closed_ok",
+        close_error: str = "",
+        settlement_key: str = "",
+    ):
+        import datetime
+        opened_at = state.get("opened_at")
+        closed_at = datetime.datetime.now(datetime.timezone.utc)
+        market_timestamp = None
+        if isinstance(start_time, datetime.datetime):
+            market_timestamp = start_time.isoformat()
+
+        entry_shares = float(state.get("entry_shares", 0.0))
+        entry_price = float(state.get("entry_price", 0.0))
+        bet_size_usd = float(state.get("current_amount", 0.0))
+
+        entry_notional_usd = round(entry_shares * entry_price, 4)
+        exit_value_est_usd = round(entry_shares * exit_price, 4)
+        payout_est_usd = round(entry_shares * (1.0 if is_win is True else 0.0), 4)
+        pnl_est_usd = round(exit_value_est_usd - entry_notional_usd, 4)
+        session_stats = self.app_state["martingale_session_stats"]
+        if is_win is not None:
+            session_stats["trades"] += 1
+            if is_win:
+                session_stats["wins"] += 1
+            else:
+                session_stats["losses"] += 1
+        session_stats["cum_pnl_usd"] = round(float(session_stats["cum_pnl_usd"]) + pnl_est_usd, 4)
+        trades = int(session_stats["trades"])
+        wins = int(session_stats["wins"])
+        losses = int(session_stats["losses"])
+        win_rate = round((wins / trades) * 100.0, 2) if trades > 0 else 0.0
+
+        self._append_trade_to_excel({
+            "Market": slug,
+            "Market timestamp (UTC)": market_timestamp,
+            "Position opened timestamp (UTC)": opened_at.isoformat() if opened_at else None,
+            "Position closed timestamp (UTC)": closed_at.isoformat(),
+            "Market timestamp (local)": self._format_ts_local(start_time if isinstance(start_time, datetime.datetime) else None),
+            "Position opened timestamp (local)": self._format_ts_local(opened_at),
+            "Position closed timestamp (local)": self._format_ts_local(closed_at),
+            "Direction": state["direction"],
+            "Bet Size USD (target)": round(bet_size_usd, 4),
+            "Shares": round(entry_shares, 4),
+            "Entry Price": round(entry_price, 6),
+            "Exit Price (snapshot)": round(exit_price, 6),
+            "Entry Notional USD": entry_notional_usd,
+            "Exit Value USD (estimate)": exit_value_est_usd,
+            "Result": "WIN" if is_win is True else ("LOSS" if is_win is False else "PENDING"),
+            "Payout USD (estimate)": payout_est_usd,
+            "PnL USD (estimate)": pnl_est_usd,
+            "Close Status": close_status,
+            "Close Error": close_error[:220] if close_error else "",
+            "Settlement Key": settlement_key,
+            "Token ID": state.get("target_token_id"),
+            "Streak_Level": state["streak"],
+            "Dry_Run": self.dry_run,
+            "Session started at (UTC)": session_stats["started_at"],
+            "Session trades": trades,
+            "Session wins": wins,
+            "Session losses": losses,
+            "Session win rate %": win_rate,
+            "Session cumulative PnL USD": float(session_stats["cum_pnl_usd"]),
+        })
+
+    def _format_ts_local(self, dt):
+        if dt is None:
+            return None
+        try:
+            local_tz = ZoneInfo(os.getenv("BOT_TIMEZONE", "Europe/Madrid"))
+            return dt.astimezone(local_tz).strftime("%Y-%m-%d %H:%M:%S %Z")
+        except Exception:
+            return dt.isoformat()
 
     def load_state(self):
         import json
@@ -118,7 +251,7 @@ class CopyTrader:
     def log(self, message: str):
         print(message)
         self.logs.append(message)
-        if len(self.logs) > 1000:
+        if len(self.logs) > 300:
             self.logs.pop(0)
 
     async def start(self, duration_minutes: int = None):
@@ -181,6 +314,17 @@ class CopyTrader:
                                 break
                         
                         await self.tick(session)
+                        import time
+                        now_ts = time.time()
+                        if self._last_reconcile_ts is None or (now_ts - self._last_reconcile_ts) >= 60:
+                            await self.reconcile_pending_settlements(session)
+                            self._last_reconcile_ts = now_ts
+                        if self._last_heartbeat_ts is None or (now_ts - self._last_heartbeat_ts) >= 60:
+                            self.log(
+                                f"[Heartbeat] running=True | strategy={self.strategy_mode} | "
+                                f"poll={self.poll_interval}s | logs={len(self.logs)}"
+                            )
+                            self._last_heartbeat_ts = now_ts
                         await asyncio.sleep(self.poll_interval)
         except Exception as e:
             self.log(f"Critical Error in Monitor Loop: {e}")
@@ -470,6 +614,42 @@ class CopyTrader:
         except Exception as e:
             self.log(f"[Auto-Close] Error checking positions: {e}")
                      
+    async def find_active_5m_btc_market(self):
+        """Dynamically finds the currently active 5-minute BTC market."""
+        import aiohttp
+        import datetime
+        timeout = aiohttp.ClientTimeout(total=6)
+        async with aiohttp.ClientSession(timeout=timeout) as http_session:
+            url = "https://gamma-api.polymarket.com/events?limit=500&active=true&closed=false"
+            for attempt in range(1, 4):
+                try:
+                    async with http_session.get(url, ssl=False) as response:
+                        if response.status == 200:
+                            data = await response.json()
+                            for event in data:
+                                slug = event.get('slug', '').lower()
+                                title = event.get('title', '').lower()
+                                
+                                is_btc = 'btc' in slug or 'bitcoin' in slug or 'btc' in title or 'bitcoin' in title
+                                is_5m = '5m' in slug or '5 min' in title or '5-minute' in title
+                                
+                                if is_btc and is_5m:
+                                    start_str = event.get('startTime') or event.get('startDate')
+                                    if start_str:
+                                        self._active_events_failures = 0
+                                        start_time = datetime.datetime.fromisoformat(start_str.replace("Z", "+00:00"))
+                                        return {'start_time': start_time, 'markets': event.get('markets', []), 'slug': event.get('slug')}
+                except Exception as e:
+                    if self.debug_logs:
+                        self.log(f"[Warn] Active events fetch failed (attempt {attempt}/3): {e}")
+            self._active_events_failures += 1
+            import time
+            now_ts = time.time()
+            if self._last_active_events_warn_ts is None or (now_ts - self._last_active_events_warn_ts) >= 60:
+                self.log("[Warn] Active events fetch failed 3/3. Falling back to deterministic slug.")
+                self._last_active_events_warn_ts = now_ts
+        return None
+
     async def run_winning_strategy(self, session: ClientSession):
         """
         Independent strategy:
@@ -485,17 +665,28 @@ class CopyTrader:
         now_ts = time.time()
         # Round down to nearest 300s (5 min)
         window_start = int(now_ts // 300) * 300
-        slug = f"btc-updown-5m-{window_start}"
+        guessed_slug = f"btc-updown-5m-{window_start}"
         
         # Check if already traded this window in logic memory or app state
         if "winning_trades" not in self.app_state:
             self.app_state["winning_trades"] = {}
 
-        # 2. Fetch Market Details
-        market_data = await self.get_market_by_slug(slug)
+        # 2. Fetch Market Details dynamically
+        market_data = await self.find_active_5m_btc_market()
         if not market_data:
+            market_data = await self.get_market_by_slug(guessed_slug)
+            if market_data:
+                market_data['slug'] = guessed_slug
+
+        if not market_data:
+            current_window = int(now_ts // 300) * 300
+            if getattr(self, "_last_logged_no_market_win", None) != current_window:
+                self.log(f"[Info] No active 5m BTC market found on Polymarket right now. Waiting...")
+                self._last_logged_no_market_win = current_window
             return
             
+        slug = market_data['slug']
+        
         # 3. Check Time Window
         now = datetime.datetime.now(datetime.timezone.utc)
         start_time = market_data['start_time']
@@ -517,6 +708,13 @@ class CopyTrader:
         
         for m in markets:
             clob_token_ids = m.get('clobTokenIds', [])
+            
+            if isinstance(clob_token_ids, str):
+                import json
+                try:
+                    clob_token_ids = json.loads(clob_token_ids)
+                except:
+                    clob_token_ids = []
             
             if len(clob_token_ids) != 2:
                 continue
@@ -563,14 +761,18 @@ class CopyTrader:
                         self.log(f"[Error] Failed sizing: {e}. Defaulting to min.")
                         size_to_buy = 1.0
 
-                self.log(f"[Winning Strat] BUY {target_token_id[:10]}... Size: {size_to_buy:.2f} @ {price_found}")
+                shares_to_buy = self._usd_to_shares(size_to_buy, price_found)
+                self.log(
+                    f"[Winning Strat] BUY {target_token_id[:10]}... "
+                    f"usd=${size_to_buy:.2f} | px={price_found:.4f} | shares={shares_to_buy:.2f}"
+                )
                 
                 if not self.dry_run:
                     try:
                         order_res = await session.call_tool("place_order", arguments={
                             "market_slug": slug, 
                             "side": "BUY",
-                            "size": size_to_buy,
+                            "size": shares_to_buy,
                             "price": 0.99, 
                             "token_id": target_token_id
                         })
@@ -585,30 +787,68 @@ class CopyTrader:
     async def run_martingale_strategy(self, session: ClientSession):
         import time
         import datetime
-        import pandas as pd
         import random
-        import os
         
         now_ts = time.time()
         # Round down to nearest 300s (5 min)
         window_start = int(now_ts // 300) * 300
-        slug = f"btc-updown-5m-{window_start}"
+        guessed_slug = f"btc-updown-5m-{window_start}"
+        
+        market_data = await self.find_active_5m_btc_market()
+        if not market_data:
+            market_data = await self.get_market_by_slug(guessed_slug)
+            if market_data:
+                market_data['slug'] = guessed_slug
+
+        if not market_data:
+            current_window = int(now_ts // 300) * 300
+            if getattr(self, "_last_logged_no_market_mart", None) != current_window:
+                self.log(f"[Info] No active 5m BTC market found on Polymarket right now. Waiting...")
+                self._last_logged_no_market_mart = current_window
+            return
+            
+        slug = market_data['slug']
         
         if "martingale_state" not in self.app_state:
             self.app_state["martingale_state"] = {
                 "active_slug": None,
                 "entry_done": False,
                 "streak": 0,
-                "current_amount": self.martingale_initial_amount,
+                "current_amount": self.martingale_initial_amount,  # USD notional
                 "direction": None, # "Yes" or "No" (UP or DOWN)
                 "entry_price": 0.0,
-                "target_token_id": None
+                "target_token_id": None,
+                "entry_shares": 0.0,
+                "opened_at": None,
+            }
+        if "martingale_session_stats" not in self.app_state:
+            self.app_state["martingale_session_stats"] = {
+                "trades": 0,
+                "wins": 0,
+                "losses": 0,
+                "cum_pnl_usd": 0.0,
+                "started_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
             }
             
         state = self.app_state["martingale_state"]
+        pending_settlements = self.app_state.get("pending_settlements", [])
+        if pending_settlements:
+            if self.debug_logs:
+                self.log("[Martingale] Waiting for previous trade settlement before new entry.")
+            return
         
-        # Reset state for a new window if active_slug is different and we haven't processed exit
-        if state["active_slug"] != slug and not str(state["active_slug"]).startswith("closed_"):
+        # If previous window is still open, force-close it before moving to a new one.
+        if state["active_slug"] and state["active_slug"] != slug and state["entry_done"]:
+            self.log(
+                f"[Martingale] Missed normal exit window for {state['active_slug']}. "
+                "Prioritizing close before new entries."
+            )
+            slug = state["active_slug"]
+            # Keep target token from state and continue into exit handling below.
+            market_data = await self.get_market_by_slug(slug) or market_data
+            if market_data and "slug" not in market_data:
+                market_data["slug"] = slug
+        elif state["active_slug"] != slug:
             state["active_slug"] = slug
             state["entry_done"] = False
             state["target_token_id"] = None
@@ -617,16 +857,24 @@ class CopyTrader:
         if state["active_slug"] == f"closed_{slug}":
             return
             
-        elapsed = now_ts - window_start
+        start_time = market_data['start_time']
+        elapsed = now_ts - start_time.timestamp()
+        
+        if self.debug_logs:
+            self.log(f"[Debug] Market found: {slug} | elapsed={elapsed:.1f}s | entry_done={state['entry_done']}")
         
         # ENTRY LOGIC -> between 5 and 60 seconds
         if 5 <= elapsed <= 60 and not state["entry_done"]:
-            market_data = await self.get_market_by_slug(slug)
-            if not market_data: return
-            
             markets = market_data.get('markets', [])
             if not markets: return
             clob_token_ids = markets[0].get('clobTokenIds', [])
+            if isinstance(clob_token_ids, str):
+                import json
+                try:
+                    clob_token_ids = json.loads(clob_token_ids)
+                except:
+                    clob_token_ids = []
+                    
             if len(clob_token_ids) != 2: return
             
             # Use random direction if first trade or won previous.
@@ -642,17 +890,26 @@ class CopyTrader:
             state["target_token_id"] = target_token_id
             
             entry_price = await self.fetch_price(target_token_id)
+            if entry_price <= 0:
+                self.log(f"[Martingale] Skipping entry for {slug}: invalid entry price {entry_price}")
+                return
             state["entry_price"] = entry_price
-            size_to_buy = state["current_amount"]
+            usd_to_buy = float(state["current_amount"])
+            shares_to_buy = self._usd_to_shares(usd_to_buy, entry_price)
+            state["entry_shares"] = shares_to_buy
+            state["opened_at"] = datetime.datetime.now(datetime.timezone.utc)
             
-            self.log(f"[Martingale] ENTRY | slug={slug} | direction={state['direction']} | amt=${size_to_buy} | streak={state['streak']}")
+            self.log(
+                f"[Martingale] ENTRY | slug={slug} | direction={state['direction']} | "
+                f"usd=${usd_to_buy:.2f} | px={entry_price:.4f} | shares={shares_to_buy:.2f} | streak={state['streak']}"
+            )
             
             if not self.dry_run:
                 try:
                     order_res = await session.call_tool("place_order", arguments={
                         "market_slug": slug, 
                         "side": "BUY",
-                        "size": size_to_buy,
+                        "size": shares_to_buy,
                         "price": 0.99, # Aggressive FOK
                         "token_id": target_token_id
                     })
@@ -664,66 +921,165 @@ class CopyTrader:
                 
             state["entry_done"] = True
             
-        # EXIT LOGIC -> between 270s and 300s (4m30s to 5m)
-        elif 270 <= elapsed <= 300 and state["entry_done"]:
+        # EXIT LOGIC -> from 270s onward until closed (prevents missing closes on delayed polls)
+        elif elapsed >= 270 and state["entry_done"]:
             target_token_id = state["target_token_id"]
             if not target_token_id:
                 return
                 
             exit_price = await self.fetch_price(target_token_id)
             
-            # Simple heuristic for win/loss before resolution: if price > 0.5 near expiry, it's very likely a win.
-            is_win = exit_price >= 0.5
-            
-            self.log(f"[Martingale] EXIT | slug={slug} | direction={state['direction']} | exit_price={exit_price} | WIN={is_win}")
-            
-            if not self.dry_run:
-                try:
-                    order_res = await session.call_tool("place_order", arguments={
-                        "market_slug": slug, 
-                        "side": "SELL",
-                        "size": state["current_amount"],
-                        "price": 0.01, # Aggressive FOK Sell
-                        "token_id": target_token_id
-                    })
-                    self.log(f"[Martingale] Executed Sell: {order_res.content[0].text[:50]}...")
-                except Exception as e:
-                    self.log(f"[Error] Martingale Sell failed: {e}")
-            
+            # Auto-close/settlement mode: do not force SELL orders on expiry.
+            self.log(f"[Martingale] EXIT | slug={slug} | direction={state['direction']} | exit_price={exit_price} | settlement=auto")
+
             # Logging to Excel
             try:
-                excel_path = os.path.join(os.path.dirname(__file__), "..", "historical_performance.xlsx")
-                new_row = pd.DataFrame([{
-                    "Timestamp": datetime.datetime.now(),
-                    "Market": slug,
-                    "Direction": state["direction"],
-                    "Amount": state["current_amount"],
-                    "Entry Price": state["entry_price"],
-                    "Exit Price": exit_price,
-                    "Outcome": "WIN" if is_win else "LOSS",
-                    "Streak_Level": state["streak"]
-                }])
-                
-                if os.path.exists(excel_path):
-                    df = pd.read_excel(excel_path)
-                    df = pd.concat([df, new_row], ignore_index=True)
-                else:
-                    df = new_row
-                df.to_excel(excel_path, index=False)
+                settlement_key = f"{slug}|{state.get('opened_at').isoformat() if state.get('opened_at') else now_ts}"
+                self._record_martingale_trade_row(
+                    state=state,
+                    slug=slug,
+                    start_time=start_time,
+                    exit_price=exit_price,
+                    is_win=None,
+                    close_status="awaiting_settlement",
+                    close_error="No manual SELL: relying on Polymarket auto-close/settlement.",
+                    settlement_key=settlement_key,
+                )
+                self.app_state["pending_settlements"].append({
+                    "settlement_key": settlement_key,
+                    "slug": slug,
+                    "token_id": state.get("target_token_id"),
+                    "opened_at": state.get("opened_at").isoformat() if state.get("opened_at") else None,
+                    "entry_shares": float(state.get("entry_shares", 0.0)),
+                    "entry_price": float(state.get("entry_price", 0.0)),
+                    "direction": state.get("direction"),
+                    "bet_size_usd": float(state.get("current_amount", self.martingale_initial_amount)),
+                    "is_martingale": True,
+                })
             except Exception as e:
                 self.log(f"[Error] Failed saving to excel: {e}")
             
-            # Update state for next window
-            if is_win:
-                state["streak"] = 0
-                state["direction"] = None
-                state["current_amount"] = self.martingale_initial_amount
-            else:
-                state["streak"] += 1
-                state["current_amount"] *= 2
-                
+            # Wait for settlement reconciliation to determine win/loss and next sizing.
             state["entry_done"] = False
             state["active_slug"] = f"closed_{slug}"
+
+    async def _infer_settlement_result(self, slug: str, token_id: str):
+        market_data = await self.get_market_by_slug(slug)
+        if market_data:
+            markets = market_data.get("markets", [])
+            for m in markets:
+                clob_token_ids = m.get("clobTokenIds", [])
+                if isinstance(clob_token_ids, str):
+                    import json
+                    try:
+                        clob_token_ids = json.loads(clob_token_ids)
+                    except Exception:
+                        clob_token_ids = []
+                if token_id not in clob_token_ids:
+                    continue
+                idx = clob_token_ids.index(token_id)
+                outcome_prices = m.get("outcomePrices", [])
+                if isinstance(outcome_prices, str):
+                    import json
+                    try:
+                        outcome_prices = json.loads(outcome_prices)
+                    except Exception:
+                        outcome_prices = []
+                if isinstance(outcome_prices, list) and len(outcome_prices) > idx:
+                    try:
+                        p = float(outcome_prices[idx])
+                        if p >= 0.99:
+                            return True, 1.0
+                        if p <= 0.01:
+                            return False, 0.0
+                    except Exception:
+                        pass
+        last_price = await self.fetch_price(token_id)
+        if last_price >= 0.99:
+            return True, 1.0
+        if last_price <= 0.01:
+            return False, 0.0
+        return None, None
+
+    async def reconcile_pending_settlements(self, session: ClientSession):
+        pending = self.app_state.get("pending_settlements", [])
+        if not pending:
+            return
+        proxy_address = os.getenv("POLYMARKET_PROXY_ADDRESS")
+        if not proxy_address:
+            return
+        try:
+            positions_result = await session.call_tool("get_wallet_positions", arguments={"address": proxy_address})
+            content = positions_result.content[0].text if positions_result and positions_result.content else "[]"
+            import json
+            import ast
+            try:
+                positions = json.loads(content) if isinstance(content, str) else content
+            except Exception:
+                positions = ast.literal_eval(content) if isinstance(content, str) else []
+
+            open_assets = set()
+            if isinstance(positions, list):
+                for p in positions:
+                    try:
+                        if abs(float(p.get("size", 0.0))) > 0:
+                            open_assets.add(str(p.get("asset")))
+                    except Exception:
+                        continue
+
+            still_pending = []
+            for item in pending:
+                token_id = str(item.get("token_id"))
+                if token_id in open_assets:
+                    still_pending.append(item)
+                    continue
+
+                is_win, settled_price = await self._infer_settlement_result(item.get("slug"), token_id)
+                if is_win is None:
+                    still_pending.append(item)
+                    continue
+
+                shares = float(item.get("entry_shares", 0.0))
+                entry_price = float(item.get("entry_price", 0.0))
+                payout = round(shares * (1.0 if is_win else 0.0), 4)
+                pnl = round(payout - (shares * entry_price), 4)
+                try:
+                    self._update_trade_row_in_excel(
+                        settlement_key=item.get("settlement_key"),
+                        updates={
+                            "Result": "WIN" if is_win else "LOSS",
+                            "Payout USD (estimate)": payout,
+                            "PnL USD (estimate)": pnl,
+                            "Exit Price (snapshot)": settled_price,
+                            "Close Status": "settled",
+                            "Close Error": "",
+                        },
+                    )
+                    if item.get("is_martingale"):
+                        m_state = self.app_state.get("martingale_state", {})
+                        if is_win:
+                            m_state["streak"] = 0
+                            m_state["direction"] = None
+                            m_state["current_amount"] = self.martingale_initial_amount
+                        else:
+                            m_state["streak"] = int(m_state.get("streak", 0)) + 1
+                            prev_bet = float(item.get("bet_size_usd", self.martingale_initial_amount))
+                            m_state["current_amount"] = round(prev_bet * 2.0, 2)
+                except PermissionError:
+                    import time
+                    now_ts = time.time()
+                    if self._last_excel_lock_warn_ts is None or (now_ts - self._last_excel_lock_warn_ts) >= 60:
+                        self.log("[Warn] Excel file is open/locked. Settlement updates will retry every 60s.")
+                        self._last_excel_lock_warn_ts = now_ts
+                    still_pending.append(item)
+                except Exception as e:
+                    self.log(f"[Warn] Failed to update settlement row: {e}")
+                    still_pending.append(item)
+
+            self.app_state["pending_settlements"] = still_pending
+        except Exception as e:
+            if self.debug_logs:
+                self.log(f"[Warn] Settlement reconciliation failed: {e}")
 
     async def get_market_by_slug(self, slug: str):
         import aiohttp
@@ -731,12 +1087,12 @@ class CopyTrader:
         async with aiohttp.ClientSession() as http_session:
             url = f"https://gamma-api.polymarket.com/events?slug={slug}"
             try:
-                async with http_session.get(url) as response:
+                async with http_session.get(url, ssl=False) as response:
                     if response.status == 200:
                         data = await response.json()
                         if isinstance(data, list) and len(data) > 0:
                             event = data[0]
-                            start_str = event.get('startDate') or event.get('startTime')
+                            start_str = event.get('startTime') or event.get('startDate')
                             if start_str:
                                 start_time = datetime.datetime.fromisoformat(start_str.replace("Z", "+00:00"))
                                 return {'start_time': start_time, 'markets': event.get('markets', [])}
@@ -746,10 +1102,11 @@ class CopyTrader:
 
     async def fetch_price(self, asset_id: str) -> float:
         import aiohttp
-        async with aiohttp.ClientSession() as http_session:
+        timeout = aiohttp.ClientTimeout(total=5)
+        async with aiohttp.ClientSession(timeout=timeout) as http_session:
             url = f"https://clob.polymarket.com/price?token_id={asset_id}&side=buy"
             try:
-                async with http_session.get(url) as response:
+                async with http_session.get(url, ssl=False) as response:
                     if response.status == 200:
                         data = await response.json()
                         return float(data.get('price', 0))
@@ -767,7 +1124,7 @@ class CopyTrader:
         async with aiohttp.ClientSession() as http_session:
             url = f"https://gamma-api.polymarket.com/markets?token_id={asset_id}"
             try:
-                async with http_session.get(url) as response:
+                async with http_session.get(url, ssl=False) as response:
                     if response.status == 200:
                         data = await response.json()
                         if isinstance(data, list) and len(data) > 0:

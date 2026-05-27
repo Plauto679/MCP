@@ -1,9 +1,10 @@
 import os
 from mcp.server.fastmcp import FastMCP
-from py_clob_client.client import ClobClient
-from py_clob_client.clob_types import ApiCreds, OrderArgs
+from py_clob_client_v2.client import ClobClient
+from py_clob_client_v2.clob_types import ApiCreds, OrderArgsV2, OrderType
 from dotenv import load_dotenv
 import sys
+from eth_account import Account
 
 # Load environment variables
 load_dotenv()
@@ -19,8 +20,25 @@ CHAIN_ID = 137  # Polygon
 # Initialize Server
 mcp = FastMCP("Polymarket MCP")
 
+def _resolve_signature_type(proxy_address: str | None) -> int:
+    """
+    Resolve signature type with sane defaults:
+    - EOA wallet (no proxy): 0
+    - Proxy wallet configured: 1 (POLY_PROXY)
+    """
+    default_sig_type = 1 if proxy_address else 0
+    sig_type_str = os.getenv("POLYMARKET_SIGNATURE_TYPE")
+    if not sig_type_str:
+        return default_sig_type
+    try:
+        sig_type = int(sig_type_str)
+    except ValueError:
+        return default_sig_type
+    return sig_type
+
+
 def get_client() -> ClobClient:
-    """Helper to initialize the CLOB client."""
+    """Helper to initialize the CLOB v2 client."""
     creds = None
     if POLYMARKET_API_KEY and POLYMARKET_API_SECRET and POLYMARKET_PASSPHRASE:
         creds = ApiCreds(
@@ -28,35 +46,32 @@ def get_client() -> ClobClient:
             api_secret=POLYMARKET_API_SECRET,
             api_passphrase=POLYMARKET_PASSPHRASE
         )
-    
-    # Determine connection type
-    # 0 = EOA (Default), 1 = Poly Proxy (Magic/Google), 2 = Gnosis Safe
-    # If POLYMARKET_PROXY_ADDRESS is set, we assume type 1 (Poly Proxy) for now.
+
     proxy_address = os.getenv("POLYMARKET_PROXY_ADDRESS")
-    
+    sig_type = _resolve_signature_type(proxy_address)
+    signer_address = Account.from_key(PRIVATE_KEY).address if PRIVATE_KEY else None
+
     if proxy_address:
-        # Log to stderr to avoid breaking MCP JSON-RPC protocol
-        print(f"Using Proxy Wallet: {proxy_address} (Signature Type 2 - Gnosis Safe)", file=sys.stderr)
+        print(
+            f"Using Proxy Wallet: {proxy_address} | Signer: {signer_address} | Signature Type {sig_type}",
+            file=sys.stderr
+        )
         return ClobClient(
             host=HOST,
             key=PRIVATE_KEY,
             creds=creds,
             chain_id=CHAIN_ID,
-            signature_type=2, # 2 = Gnosis Safe (most common for browser wallet connections)
-            funder=proxy_address # Funder is the proxy address
+            signature_type=sig_type,
+            funder=proxy_address
         )
     else:
-        # Log to stderr to avoid breaking MCP JSON-RPC protocol
-        print("Using EOA Wallet (Signature Type 0)", file=sys.stderr)
-        # For EOA, the funder is derived from the private key automatically
-        # Do NOT pass creds.api_key as funder - that's a UUID, not an address!
+        print(f"Using EOA Wallet: {signer_address} (Signature Type {sig_type})", file=sys.stderr)
         return ClobClient(
             host=HOST,
             key=PRIVATE_KEY,
             creds=creds,
             chain_id=CHAIN_ID,
-            signature_type=0  # 0 = EOA
-            # funder parameter omitted - will be auto-derived from private key
+            signature_type=sig_type
         )
 
 @mcp.tool()
@@ -67,8 +82,6 @@ def get_market(condition_id: str):
         condition_id: The unique identifier for the market/condition.
     """
     client = get_client()
-    # Note: specific method depends on library version, usually get_market or similar
-    # If strictly using CLOB API, we might use get_market(condition_id)
     try:
         return client.get_market(condition_id)
     except Exception as e:
@@ -82,7 +95,6 @@ def get_wallet_positions(address: str):
     """
     import requests
     import json
-    # Use Data API for reading positions
     url = f"https://data-api.polymarket.com/positions?user={address}"
     try:
         resp = requests.get(url)
@@ -94,44 +106,35 @@ def get_wallet_positions(address: str):
 @mcp.tool()
 def place_order(market_slug: str, side: str, size: float, price: float, token_id: str):
     """
-    Place a limit order on the CLOB.
+    Place a limit order on the CLOB (v2).
     Args:
-        market_slug: Not used directly in CLOB usually, but for reference. 
-                     We need token_id usually.
+        market_slug: For reference only.
         side: 'BUY' or 'SELL'.
-        size: Amount to buy/sell.
-        price: Limit price.
+        size: Amount to buy/sell (in conditional tokens).
+        price: Limit price (0–1).
         token_id: The asset ID (token ID) to trade.
     """
     client = get_client()
     if not POLYMARKET_API_KEY:
         return "Error: API Keys not configured. Cannot place orders."
-    
+
     try:
-        from py_clob_client.clob_types import OrderType
-        # Define constants if not imported
-        BUY = "BUY"
-        SELL = "SELL"
-        
+        import json
+
         # Validate Side
         side_str = side.upper()
-        if side_str not in [BUY, SELL]:
+        if side_str not in ["BUY", "SELL"]:
             return f"Error: Invalid side {side}. Must be BUY or SELL."
 
-        # Round size to 2 decimal places (Polymarket requirement for maker amount)
+        # Round size to 2 decimal places (Polymarket requirement)
         rounded_size = round(float(size), 2)
-        
+
         # Enforce Polymarket's minimum order value of $1
-        # For BUY orders: total value = size × price
-        # For SELL orders: total value = size × (1 - price)
         min_order_value = 1.0
-        
         if side_str == "BUY":
             order_value = rounded_size * float(price)
             if order_value < min_order_value:
-                # Adjust size upward to meet minimum
                 rounded_size = round(min_order_value / float(price), 2)
-                # Ensure we round UP to avoid still being under $1
                 if rounded_size * float(price) < min_order_value:
                     rounded_size = round(rounded_size + 0.01, 2)
         else:  # SELL
@@ -140,50 +143,53 @@ def place_order(market_slug: str, side: str, size: float, price: float, token_id
                 rounded_size = round(min_order_value / (1.0 - float(price)), 2)
                 if rounded_size * (1.0 - float(price)) < min_order_value:
                     rounded_size = round(rounded_size + 0.01, 2)
-        
-        order_args = OrderArgs(
-            price=price,
+
+        order_args = OrderArgsV2(
+            price=float(price),
             size=rounded_size,
             side=side_str,
             token_id=token_id
         )
-        
-        # Use GTC (Good-Til-Canceled) as the standard order type
-        # This allows partial fills and better execution than FOK
-        
-        # 1. Create and Sign
-        signed_order = client.create_order(order_args)
-        
-        # 2. Post with GTC (default, most reliable)
-        resp = client.post_order(
-            signed_order,
-            orderType=OrderType.GTC
+
+        # create_and_post_order handles both sign + submit atomically (v2)
+        resp = client.create_and_post_order(
+            order_args=order_args,
+            order_type=OrderType.GTC,
         )
-        
-        # The response is an Order object/Dict, we need to serialize it
-        import json
+
         try:
-            # Try to get the ID and other details. usually resp['orderID'] or resp.id
             if isinstance(resp, dict):
                 return json.dumps(resp, default=str)
             elif hasattr(resp, '__dict__'):
                 return json.dumps(resp.__dict__, default=str)
             else:
                 return json.dumps({"orderID": str(resp), "raw": str(resp)})
-        except:
-             return str(resp)
+        except Exception:
+            return str(resp)
+
     except Exception as e:
         import traceback
         traceback.print_exc()
-        
-        # Check for specific Polymarket errors
+
         error_msg = str(e)
         if "does not exist" in error_msg:
-            return f"Error: Market/orderbook does not exist (likely closed or settled). Skipping this trade."
+            return "Error: Market/orderbook does not exist (likely closed or settled). Skipping this trade."
         elif "not enough balance" in error_msg or "allowance" in error_msg:
-            return f"Error: Insufficient balance or allowance in Proxy Wallet. Please fund your account."
+            return "Error: Insufficient balance or allowance in Proxy Wallet. Please fund your account."
         elif "Unauthorized" in error_msg or "Invalid api key" in error_msg:
-            return f"Error: API authentication failed. Please regenerate API keys."
+            return "Error: API authentication failed. Please regenerate API keys."
+        elif "invalid signature" in error_msg.lower():
+            proxy_address = os.getenv("POLYMARKET_PROXY_ADDRESS")
+            sig_type = _resolve_signature_type(proxy_address)
+            signer_address = Account.from_key(PRIVATE_KEY).address if PRIVATE_KEY else "N/A"
+            return (
+                "Error: invalid signature. "
+                f"Signer={signer_address}, Proxy={proxy_address or 'N/A'}, SignatureType={sig_type}. "
+                "For Proxy wallet use SignatureType=1 and ensure PRIVATE_KEY controls that proxy. "
+                "If using EOA directly, unset POLYMARKET_PROXY_ADDRESS and use SignatureType=0."
+            )
+        elif "order_version_mismatch" in error_msg:
+            return "Error: order_version_mismatch — check that py-clob-client-v2 is installed correctly."
         else:
             return f"Error placing order: {error_msg}"
 
@@ -203,35 +209,15 @@ def cancel_all():
 @mcp.tool()
 def get_balance():
     """
-    Get the USDC balance of the bot's wallet (Proxy or EOA).
+    Get the USDC balance/allowance of the bot's wallet (Proxy or EOA).
     """
     client = get_client()
     if not POLYMARKET_API_KEY:
         return "Error: API Keys not configured."
     try:
-        # Fetch collateral (USDC) balance
-        # The client usually exposes this via get_balance_allowance or similar
-        # For simplicity, we can fetch the portfolio or user info
-        # Let's try to use the derived funder address
-        funder = client.funder
-        
-        # Use Data API to search for collateral balance
-        # or use clob client method if available. 
-        # client.get_balance_allowance requires an asset_type usually.
-        # Let's use simple requests to Data API for USDC balance of the user
-        import requests
-        # USDC (Polygon) Token Address: 0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174
-        # But data-api might have a simpler endpoint.
-        # Let's try client.get_account_balance() if it exists?
-        # Checking py-clob-client docs (mental check): it has get_balance_allowance
-        
-        # We can also use get_wallet_positions logic but filter for USDC?
-        # Actually, get_wallet_positions returns positions in markets, not USDC balance.
-        
-        # Let's use the ClobClient's get_balance_allowance
-        from py_clob_client.clob_types import AssetType
+        from py_clob_client_v2.clob_types import BalanceAllowanceParams, AssetType
         resp = client.get_balance_allowance(
-            params=None # This usually defaults to USDC (collateral)
+            params=BalanceAllowanceParams(asset_type=AssetType.COLLATERAL)
         )
         return str(resp)
     except Exception as e:
