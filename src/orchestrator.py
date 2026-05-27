@@ -159,7 +159,7 @@ class CopyTrader:
         self._append_trade_to_excel({
             "Market": slug,
             "Market timestamp (UTC)": market_timestamp,
-            "Position opened timestamp (UTC)": opened_at.isoformat() if opened_at else None,
+            "Position opened timestamp (UTC)": opened_at.isoformat() if hasattr(opened_at, "isoformat") else opened_at,
             "Position closed timestamp (UTC)": closed_at.isoformat(),
             "Market timestamp (local)": self._format_ts_local(start_time if isinstance(start_time, datetime.datetime) else None),
             "Position opened timestamp (local)": self._format_ts_local(opened_at),
@@ -191,6 +191,8 @@ class CopyTrader:
     def _format_ts_local(self, dt):
         if dt is None:
             return None
+        if isinstance(dt, str):
+            return dt
         try:
             local_tz = ZoneInfo(os.getenv("BOT_TIMEZONE", "Europe/Madrid"))
             return dt.astimezone(local_tz).strftime("%Y-%m-%d %H:%M:%S %Z")
@@ -218,7 +220,22 @@ class CopyTrader:
                     self.winning_price_threshold = config.get('winning_price_threshold', 0.75)
                     self.winning_entry_time = config.get('winning_entry_time', 3.0)
                     self.winning_exit_time = config.get('winning_exit_time', 4.5)
+                    self.strategy_mode = config.get('strategy_mode', self.strategy_mode)
+                    self.winning_size_mode = config.get('winning_size_mode', self.winning_size_mode)
+                    self.winning_size_value = config.get('winning_size_value', self.winning_size_value)
+                    self.martingale_initial_amount = config.get('martingale_initial_amount', self.martingale_initial_amount)
                     self.app_state["multipliers"] = data.get('multipliers', {})
+                    self.app_state["pending_settlements"] = data.get('pending_settlements', [])
+                    martingale_state = data.get('martingale_state')
+                    if martingale_state:
+                        opened_at = martingale_state.get("opened_at")
+                        if isinstance(opened_at, str):
+                            from datetime import datetime
+                            try:
+                                martingale_state["opened_at"] = datetime.fromisoformat(opened_at)
+                            except ValueError:
+                                martingale_state["opened_at"] = None
+                        self.app_state["martingale_state"] = martingale_state
                     self.history = data.get('history', [])
                     self.log(f"State loaded from {self.data_file}")
             except Exception as e:
@@ -226,7 +243,12 @@ class CopyTrader:
 
     def save_state(self):
         import json
-        from datetime import datetime
+        martingale_state = self.app_state.get("martingale_state")
+        if martingale_state:
+            martingale_state = martingale_state.copy()
+            opened_at = martingale_state.get("opened_at")
+            if hasattr(opened_at, "isoformat"):
+                martingale_state["opened_at"] = opened_at.isoformat()
         data = {
             "config": {
                 "target_wallets": self.target_wallets,
@@ -237,10 +259,16 @@ class CopyTrader:
                 "winning_strategy_enabled": self.winning_strategy_enabled,
                 "winning_price_threshold": self.winning_price_threshold,
                 "winning_entry_time": self.winning_entry_time,
-                "winning_exit_time": self.winning_exit_time
+                "winning_exit_time": self.winning_exit_time,
+                "strategy_mode": self.strategy_mode,
+                "winning_size_mode": self.winning_size_mode,
+                "winning_size_value": self.winning_size_value,
+                "martingale_initial_amount": self.martingale_initial_amount
             },
             "multipliers": self.app_state["multipliers"],
-            "history": self.history
+            "history": self.history,
+            "pending_settlements": self.app_state.get("pending_settlements", []),
+            "martingale_state": martingale_state
         }
         try:
             with open(self.data_file, 'w') as f:
@@ -313,12 +341,19 @@ class CopyTrader:
                                 self.running = False
                                 break
                         
-                        await self.tick(session)
                         import time
                         now_ts = time.time()
-                        if self._last_reconcile_ts is None or (now_ts - self._last_reconcile_ts) >= 60:
+                        has_pending_settlements = bool(self.app_state.get("pending_settlements"))
+                        should_reconcile = (
+                            self._last_reconcile_ts is None
+                            or (now_ts - self._last_reconcile_ts) >= 60
+                            or (self.strategy_mode == "martingale" and has_pending_settlements)
+                        )
+                        if should_reconcile:
                             await self.reconcile_pending_settlements(session)
                             self._last_reconcile_ts = now_ts
+                        
+                        await self.tick(session)
                         if self._last_heartbeat_ts is None or (now_ts - self._last_heartbeat_ts) >= 60:
                             self.log(
                                 f"[Heartbeat] running=True | strategy={self.strategy_mode} | "
@@ -920,6 +955,7 @@ class CopyTrader:
                 self.log("[Martingale] Dry Run - Simulated BUY")
                 
             state["entry_done"] = True
+            self.save_state()
             
         # EXIT LOGIC -> from 270s onward until closed (prevents missing closes on delayed polls)
         elif elapsed >= 270 and state["entry_done"]:
@@ -962,6 +998,7 @@ class CopyTrader:
             # Wait for settlement reconciliation to determine win/loss and next sizing.
             state["entry_done"] = False
             state["active_slug"] = f"closed_{slug}"
+            self.save_state()
 
     async def _infer_settlement_result(self, slug: str, token_id: str):
         market_data = await self.get_market_by_slug(slug)
@@ -1006,28 +1043,28 @@ class CopyTrader:
         if not pending:
             return
         proxy_address = os.getenv("POLYMARKET_PROXY_ADDRESS")
-        if not proxy_address:
-            return
         try:
-            positions_result = await session.call_tool("get_wallet_positions", arguments={"address": proxy_address})
-            content = positions_result.content[0].text if positions_result and positions_result.content else "[]"
-            import json
-            import ast
-            try:
-                positions = json.loads(content) if isinstance(content, str) else content
-            except Exception:
-                positions = ast.literal_eval(content) if isinstance(content, str) else []
-
             open_assets = set()
-            if isinstance(positions, list):
-                for p in positions:
-                    try:
-                        if abs(float(p.get("size", 0.0))) > 0:
-                            open_assets.add(str(p.get("asset")))
-                    except Exception:
-                        continue
+            if proxy_address:
+                positions_result = await session.call_tool("get_wallet_positions", arguments={"address": proxy_address})
+                content = positions_result.content[0].text if positions_result and positions_result.content else "[]"
+                import json
+                import ast
+                try:
+                    positions = json.loads(content) if isinstance(content, str) else content
+                except Exception:
+                    positions = ast.literal_eval(content) if isinstance(content, str) else []
+
+                if isinstance(positions, list):
+                    for p in positions:
+                        try:
+                            if abs(float(p.get("size", 0.0))) > 0:
+                                open_assets.add(str(p.get("asset")))
+                        except Exception:
+                            continue
 
             still_pending = []
+            state_changed = False
             for item in pending:
                 token_id = str(item.get("token_id"))
                 if token_id in open_assets:
@@ -1065,6 +1102,11 @@ class CopyTrader:
                             m_state["streak"] = int(m_state.get("streak", 0)) + 1
                             prev_bet = float(item.get("bet_size_usd", self.martingale_initial_amount))
                             m_state["current_amount"] = round(prev_bet * 2.0, 2)
+                            self.log(
+                                f"[Martingale] LOSS settled for {item.get('slug')}. "
+                                f"Next bet: ${m_state['current_amount']:.2f} in same direction ({m_state.get('direction')})."
+                            )
+                        state_changed = True
                 except PermissionError:
                     import time
                     now_ts = time.time()
@@ -1077,6 +1119,8 @@ class CopyTrader:
                     still_pending.append(item)
 
             self.app_state["pending_settlements"] = still_pending
+            if state_changed or len(still_pending) != len(pending):
+                self.save_state()
         except Exception as e:
             if self.debug_logs:
                 self.log(f"[Warn] Settlement reconciliation failed: {e}")
