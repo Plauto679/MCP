@@ -948,9 +948,14 @@ class CopyTrader:
                         "price": 0.99, # Aggressive FOK
                         "token_id": target_token_id
                     })
-                    self.log(f"[Martingale] Executed Buy: {order_res.content[0].text[:50]}...")
+                    order_text = order_res.content[0].text if order_res and order_res.content else ""
+                    if order_text.lower().startswith("error"):
+                        self.log(f"[Error] Martingale order rejected: {order_text[:220]}")
+                        return
+                    self.log(f"[Martingale] Executed Buy: {order_text[:50]}...")
                 except Exception as e:
                      self.log(f"[Error] Martingale Execution failed: {e}")
+                     return
             else:
                 self.log("[Martingale] Dry Run - Simulated BUY")
                 
@@ -1046,14 +1051,19 @@ class CopyTrader:
         try:
             open_assets = set()
             if proxy_address:
-                positions_result = await session.call_tool("get_wallet_positions", arguments={"address": proxy_address})
-                content = positions_result.content[0].text if positions_result and positions_result.content else "[]"
-                import json
-                import ast
                 try:
-                    positions = json.loads(content) if isinstance(content, str) else content
+                    positions_result = await session.call_tool("get_wallet_positions", arguments={"address": proxy_address})
+                    content = positions_result.content[0].text if positions_result and positions_result.content else "[]"
+                    import json
+                    import ast
+                    try:
+                        positions = json.loads(content) if isinstance(content, str) else content
+                    except Exception:
+                        positions = ast.literal_eval(content) if isinstance(content, str) else []
                 except Exception:
-                    positions = ast.literal_eval(content) if isinstance(content, str) else []
+                    positions = []
+                    if self.debug_logs:
+                        self.log("[Warn] Wallet positions unavailable during settlement reconciliation; using market outcome only.")
 
                 if isinstance(positions, list):
                     for p in positions:
