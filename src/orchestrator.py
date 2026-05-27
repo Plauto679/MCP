@@ -1077,12 +1077,11 @@ class CopyTrader:
             state_changed = False
             for item in pending:
                 token_id = str(item.get("token_id"))
-                if token_id in open_assets:
-                    still_pending.append(item)
-                    continue
-
                 is_win, settled_price = await self._infer_settlement_result(item.get("slug"), token_id)
                 if is_win is None:
+                    still_pending.append(item)
+                    continue
+                if token_id in open_assets and settled_price not in (0.0, 1.0):
                     still_pending.append(item)
                     continue
 
