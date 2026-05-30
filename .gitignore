@@ -1,3 +1,11 @@
 .env
 user_data.json
 historical_performance.xlsx
+.venv/
+.venv_local/
+__pycache__/
+*.py[cod]
+*$py.class
+.DS_Store
+*.log
+run*.log

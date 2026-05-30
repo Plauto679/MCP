@@ -1,13 +1,22 @@
 import os
 from mcp.server.fastmcp import FastMCP
 from py_clob_client_v2.client import ClobClient
-from py_clob_client_v2.clob_types import ApiCreds, OrderArgsV2, OrderType
+from py_clob_client_v2.clob_types import ApiCreds, OrderArgsV2, MarketOrderArgsV2, OrderType
 from dotenv import load_dotenv
 import sys
 from eth_account import Account
+import httpx
+import py_clob_client_v2.http_helpers.helpers as clob_http_helpers
 
 # Load environment variables
 load_dotenv()
+
+# The v2 client default HTTP/2 session can timeout on POST /order under load.
+# Use a longer HTTP/1.1 client so short BTC windows do not miss entries.
+clob_http_helpers._http_client = httpx.Client(
+    http2=False,
+    timeout=httpx.Timeout(20.0, connect=5.0),
+)
 
 # Configuration
 POLYMARKET_API_KEY = os.getenv("POLYMARKET_API_KEY")
@@ -103,8 +112,28 @@ def get_wallet_positions(address: str):
     except Exception as e:
         return f"Error fetching positions: {str(e)}"
 
+def _resolve_order_type(order_type: str):
+    order_type_str = str(order_type or "GTC").upper()
+    mapping = {
+        "GTC": OrderType.GTC,
+        "GTD": OrderType.GTD,
+        "FAK": OrderType.FAK,
+        "FOK": OrderType.FOK,
+    }
+    return mapping.get(order_type_str), order_type_str
+
+
 @mcp.tool()
-def place_order(market_slug: str, side: str, size: float, price: float, token_id: str):
+def place_order(
+    market_slug: str,
+    side: str,
+    size: float,
+    price: float,
+    token_id: str,
+    order_type: str = "GTC",
+    post_only: bool = False,
+    defer_exec: bool = False,
+):
     """
     Place a limit order on the CLOB (v2).
     Args:
@@ -121,10 +150,13 @@ def place_order(market_slug: str, side: str, size: float, price: float, token_id
     try:
         import json
 
-        # Validate Side
         side_str = side.upper()
         if side_str not in ["BUY", "SELL"]:
             return f"Error: Invalid side {side}. Must be BUY or SELL."
+
+        resolved_order_type, order_type_str = _resolve_order_type(order_type)
+        if resolved_order_type is None:
+            return f"Error: Invalid order_type {order_type}. Must be GTC, GTD, FAK, or FOK."
 
         # Round size to 2 decimal places (Polymarket requirement)
         rounded_size = round(float(size), 2)
@@ -154,7 +186,9 @@ def place_order(market_slug: str, side: str, size: float, price: float, token_id
         # create_and_post_order handles both sign + submit atomically (v2)
         resp = client.create_and_post_order(
             order_args=order_args,
-            order_type=OrderType.GTC,
+            order_type=resolved_order_type,
+            post_only=bool(post_only),
+            defer_exec=bool(defer_exec),
         )
 
         try:
@@ -192,6 +226,82 @@ def place_order(market_slug: str, side: str, size: float, price: float, token_id
             return "Error: order_version_mismatch — check that py-clob-client-v2 is installed correctly."
         else:
             return f"Error placing order: {error_msg}"
+
+@mcp.tool()
+def place_market_order(
+    market_slug: str,
+    side: str,
+    amount: float,
+    token_id: str,
+    order_type: str = "FAK",
+    defer_exec: bool = False,
+):
+    """
+    Place an immediate marketable order on the CLOB (v2).
+    BUY amount is USDC. SELL amount is shares.
+    """
+    client = get_client()
+    if not POLYMARKET_API_KEY:
+        return "Error: API Keys not configured. Cannot place orders."
+
+    try:
+        import json
+
+        side_str = side.upper()
+        if side_str not in ["BUY", "SELL"]:
+            return f"Error: Invalid side {side}. Must be BUY or SELL."
+
+        order_type_str = order_type.upper()
+        if order_type_str not in ["FAK", "FOK"]:
+            return f"Error: Invalid order_type {order_type}. Must be FAK or FOK."
+        resolved_order_type = OrderType.FAK if order_type_str == "FAK" else OrderType.FOK
+
+        rounded_amount = round(float(amount), 2)
+        if rounded_amount <= 0:
+            return "Error: Invalid amount. Must be greater than 0."
+
+        order_args = MarketOrderArgsV2(
+            token_id=token_id,
+            amount=rounded_amount,
+            side=side_str,
+            order_type=resolved_order_type,
+        )
+
+        resp = client.create_and_post_market_order(
+            order_args=order_args,
+            order_type=resolved_order_type,
+            defer_exec=bool(defer_exec),
+        )
+
+        try:
+            if isinstance(resp, dict):
+                return json.dumps(resp, default=str)
+            elif hasattr(resp, '__dict__'):
+                return json.dumps(resp.__dict__, default=str)
+            else:
+                return json.dumps({"orderID": str(resp), "raw": str(resp)})
+        except Exception:
+            return str(resp)
+
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+
+        error_msg = str(e)
+        if "not enough balance" in error_msg or "allowance" in error_msg:
+            return "Error: Insufficient balance or allowance in Proxy Wallet. Please fund your account."
+        elif "Unauthorized" in error_msg or "Invalid api key" in error_msg:
+            return "Error: API authentication failed. Please regenerate API keys."
+        elif "invalid signature" in error_msg.lower():
+            proxy_address = os.getenv("POLYMARKET_PROXY_ADDRESS")
+            sig_type = _resolve_signature_type(proxy_address)
+            signer_address = Account.from_key(PRIVATE_KEY).address if PRIVATE_KEY else "N/A"
+            return (
+                "Error: invalid signature. "
+                f"Signer={signer_address}, Proxy={proxy_address or 'N/A'}, SignatureType={sig_type}."
+            )
+        else:
+            return f"Error placing market order: {error_msg}"
 
 @mcp.tool()
 def cancel_all():
