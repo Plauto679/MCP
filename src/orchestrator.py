@@ -2,6 +2,8 @@ import asyncio
 import os
 import sys
 import math
+import json
+import time
 from typing import List, Dict, Optional, Tuple
 from zoneinfo import ZoneInfo
 from dotenv import load_dotenv
@@ -58,6 +60,12 @@ class CopyTrader:
         self._http_session_loop = None
         self._martingale_market_cache = {}
         self._martingale_prefetch_attempts = {}
+        self._martingale_entry_plans = {}
+        self._chainlink_price_samples = {}
+        self._chainlink_feed_task: Optional[asyncio.Task] = None
+        self._chainlink_connected = False
+        self._last_chainlink_warn_ts: Optional[float] = None
+        self._background_tasks = set()
         self.http_headers = {
             "Accept": "application/json",
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/126 Safari/537.36",
@@ -127,6 +135,147 @@ class CopyTrader:
             await self._http_session.close()
         self._http_session = None
         self._http_session_loop = None
+
+    def _record_chainlink_price(self, timestamp_ms, value):
+        try:
+            ts = int(timestamp_ms)
+            price = float(value)
+        except (TypeError, ValueError):
+            return
+        if ts <= 0 or price <= 0:
+            return
+
+        self._chainlink_price_samples[ts] = price
+        cutoff = ts - (15 * 60 * 1000)
+        stale = [sample_ts for sample_ts in self._chainlink_price_samples if sample_ts < cutoff]
+        for sample_ts in stale:
+            self._chainlink_price_samples.pop(sample_ts, None)
+
+    def _ingest_chainlink_message(self, message: str):
+        try:
+            data = json.loads(message)
+        except (TypeError, json.JSONDecodeError):
+            return
+
+        payload = data.get("payload", {}) if isinstance(data, dict) else {}
+        if not isinstance(payload, dict):
+            return
+
+        snapshot = payload.get("data")
+        if isinstance(snapshot, list):
+            for sample in snapshot:
+                if isinstance(sample, dict):
+                    self._record_chainlink_price(sample.get("timestamp"), sample.get("value"))
+            return
+
+        symbol = str(payload.get("symbol") or "").lower()
+        if symbol and symbol != "btc/usd":
+            return
+        self._record_chainlink_price(payload.get("timestamp"), payload.get("value"))
+
+    async def _chainlink_price_feed_loop(self):
+        import websockets
+
+        subscription = json.dumps({
+            "action": "subscribe",
+            "subscriptions": [{
+                "topic": "crypto_prices_chainlink",
+                "type": "*",
+                "filters": "{\"symbol\":\"btc/usd\"}",
+            }],
+        })
+
+        while self.running:
+            try:
+                async with websockets.connect(
+                    "wss://ws-live-data.polymarket.com",
+                    ping_interval=None,
+                    close_timeout=2,
+                ) as websocket:
+                    await websocket.send(subscription)
+                    self._chainlink_connected = True
+                    self.log("[Martingale] Chainlink BTC/USD feed connected.")
+                    while self.running:
+                        try:
+                            message = await asyncio.wait_for(websocket.recv(), timeout=5.0)
+                        except asyncio.TimeoutError:
+                            await websocket.send("PING")
+                            continue
+                        if isinstance(message, str):
+                            self._ingest_chainlink_message(message)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                self._chainlink_connected = False
+                now_ts = time.time()
+                if (
+                    self._last_chainlink_warn_ts is None
+                    or now_ts - self._last_chainlink_warn_ts >= 60
+                ):
+                    self.log(f"[Warn] Chainlink feed disconnected: {exc}. Reconnecting...")
+                    self._last_chainlink_warn_ts = now_ts
+                await asyncio.sleep(1.0)
+            finally:
+                self._chainlink_connected = False
+
+    def _ensure_chainlink_price_feed(self):
+        if self._chainlink_feed_task is None or self._chainlink_feed_task.done():
+            self._chainlink_feed_task = asyncio.create_task(self._chainlink_price_feed_loop())
+
+    async def _stop_chainlink_price_feed(self):
+        if self._chainlink_feed_task is None:
+            return
+        self._chainlink_feed_task.cancel()
+        try:
+            await self._chainlink_feed_task
+        except asyncio.CancelledError:
+            pass
+        self._chainlink_feed_task = None
+        self._chainlink_connected = False
+
+    def _schedule_martingale_trade_record(self, **record_kwargs):
+        async def write_record():
+            try:
+                await asyncio.to_thread(self._record_martingale_trade_row, **record_kwargs)
+            except Exception as exc:
+                self.log(f"[Error] Failed saving martingale settlement to excel: {exc}")
+
+        task = asyncio.create_task(write_record())
+        self._background_tasks.add(task)
+        task.add_done_callback(self._background_tasks.discard)
+
+    async def _drain_background_tasks(self):
+        if not self._background_tasks:
+            return
+        await asyncio.gather(*list(self._background_tasks), return_exceptions=True)
+
+    def _chainlink_boundary_price(self, boundary_ts: float) -> Optional[float]:
+        boundary_ms = int(round(float(boundary_ts) * 1000))
+        return self._chainlink_price_samples.get(boundary_ms)
+
+    async def _infer_chainlink_window_result(
+        self,
+        slug: str,
+        direction: str,
+        wait_seconds: float = 2.5,
+    ) -> Tuple[Optional[bool], Optional[float], Optional[float]]:
+        start_time = self._start_time_from_btc_slug(slug)
+        if start_time is None or direction not in ("Yes", "No"):
+            return None, None, None
+
+        start_ts = start_time.timestamp()
+        end_ts = start_ts + 300
+        deadline = asyncio.get_running_loop().time() + max(float(wait_seconds), 0.0)
+        while True:
+            opening_price = self._chainlink_boundary_price(start_ts)
+            closing_price = self._chainlink_boundary_price(end_ts)
+            if opening_price is not None and closing_price is not None:
+                up_won = closing_price >= opening_price
+                is_win = up_won if direction == "Yes" else not up_won
+                return is_win, opening_price, closing_price
+            if asyncio.get_running_loop().time() >= deadline:
+                return None, opening_price, closing_price
+            await asyncio.sleep(0.05)
 
     def _martingale_stake_for_price(self, state: Dict, price: float) -> float:
         target_profit = max(float(self.martingale_initial_amount), 0.01)
@@ -297,63 +446,20 @@ class CopyTrader:
             return False
         return None
 
-    async def _assume_martingale_loss_for_recovery(self, state: Dict, slug: str, start_time, now_ts: float) -> bool:
-        if not self._martingale_in_recovery(state):
-            return False
-
-        target_token_id = state.get("target_token_id")
-        if not target_token_id:
-            return False
-
-        snapshot_price = await self.fetch_price(target_token_id)
-        self.log(
-            f"[Martingale] UNRESOLVED | slug={slug} | direction={state.get('direction')} | "
-            f"snapshot={snapshot_price:.4f}. Assuming LOSS to preserve recovery cycle."
-        )
-
-        settlement_key = f"{slug}|{state.get('opened_at').isoformat() if hasattr(state.get('opened_at'), 'isoformat') else (state.get('opened_at') or now_ts)}"
-        try:
-            self._record_martingale_trade_row(
-                state=state,
-                slug=slug,
-                start_time=start_time,
-                exit_price=snapshot_price,
-                is_win=False,
-                close_status="assumed_loss",
-                close_error="Official outcome was not 0/1 yet; assumed loss to continue martingale recovery.",
-                settlement_key=settlement_key,
-            )
-        except Exception as e:
-            self.log(f"[Error] Failed saving assumed-loss settlement to excel: {e}")
-
-        shares = float(state.get("entry_shares", 0.0))
-        entry_price = float(state.get("entry_price", 0.0))
-        self._apply_martingale_result(state, slug, False, shares, entry_price)
-        state["entry_done"] = False
-        state["active_slug"] = None
-        state["target_token_id"] = None
-        state["entry_price"] = 0.0
-        state["entry_shares"] = 0.0
-        state["opened_at"] = None
-        state["entry_retry_after"] = 0.0
-        state["entry_attempts"] = 0
-        state["skip_logged"] = False
-        self.save_state()
-        return True
-
     async def _settle_active_martingale_trade(self, state: Dict, slug: str, start_time, now_ts: float) -> bool:
         target_token_id = state.get("target_token_id")
         if not target_token_id:
             return False
 
-        is_win, settled_price = await self._infer_settlement_result(slug, target_token_id)
+        is_win, opening_price, closing_price = await self._infer_chainlink_window_result(
+            slug=slug,
+            direction=state.get("direction"),
+        )
+        settlement_source = "chainlink_boundary"
+        settled_price = None
         if is_win is None:
-            snapshot_price = await self.fetch_price(target_token_id)
-            if snapshot_price > 0:
-                snapshot_result = self._binary_result_from_price(snapshot_price)
-                if snapshot_result is not None:
-                    is_win = snapshot_result
-                    settled_price = 1.0 if snapshot_result else 0.0
+            is_win, settled_price = await self._infer_settlement_result(slug, target_token_id)
+            settlement_source = "official_outcome"
         if is_win is None:
             return False
 
@@ -362,23 +468,27 @@ class CopyTrader:
             exit_price = float(settled_price)
         self.log(
             f"[Martingale] EXIT | slug={slug} | direction={state.get('direction')} | "
-            f"exit_price={exit_price} | settlement=fast"
+            f"exit_price={exit_price} | settlement={settlement_source}"
         )
+        if settlement_source == "chainlink_boundary":
+            self.log(
+                f"[Martingale] Chainlink boundary | open={opening_price:.8f} | "
+                f"close={closing_price:.8f} | "
+                f"decision_latency={max(time.time() - (start_time.timestamp() + 300), 0.0):.2f}s"
+            )
 
         settlement_key = f"{slug}|{state.get('opened_at').isoformat() if hasattr(state.get('opened_at'), 'isoformat') else (state.get('opened_at') or now_ts)}"
-        try:
-            self._record_martingale_trade_row(
-                state=state,
-                slug=slug,
-                start_time=start_time,
-                exit_price=exit_price,
-                is_win=is_win,
-                close_status="settled",
-                close_error="Fast settlement at next window boundary.",
-                settlement_key=settlement_key,
-            )
-        except Exception as e:
-            self.log(f"[Error] Failed saving fast settlement to excel: {e}")
+        record_state = state.copy()
+        self._schedule_martingale_trade_record(
+            state=record_state,
+            slug=slug,
+            start_time=start_time,
+            exit_price=exit_price,
+            is_win=is_win,
+            close_status="settled",
+            close_error=f"Settlement source: {settlement_source}.",
+            settlement_key=settlement_key,
+        )
 
         shares = float(state.get("entry_shares", 0.0))
         entry_price = float(state.get("entry_price", 0.0))
@@ -395,14 +505,70 @@ class CopyTrader:
         self.save_state()
         return True
 
-    async def _prefetch_martingale_market(self, slug: str, now_ts: float):
-        if slug in self._martingale_market_cache:
-            return
+    def _extract_clob_token_ids(self, market_data: Dict) -> List[str]:
+        markets = market_data.get("markets", []) if isinstance(market_data, dict) else []
+        if not markets:
+            return []
+        token_ids = markets[0].get("clobTokenIds", [])
+        if isinstance(token_ids, str):
+            try:
+                token_ids = json.loads(token_ids)
+            except json.JSONDecodeError:
+                token_ids = []
+        if not isinstance(token_ids, list) or len(token_ids) != 2:
+            return []
+        return [str(token_id) for token_id in token_ids]
+
+    async def _prepare_martingale_entry_plan(self, state: Dict, slug: str, now_ts: float):
+        existing = self._martingale_entry_plans.get(slug)
+        if existing and existing.get("token_ids"):
+            return existing
+
         last_attempt = float(self._martingale_prefetch_attempts.get(slug, 0.0) or 0.0)
         if now_ts - last_attempt < 5.0:
-            return
+            return existing
         self._martingale_prefetch_attempts[slug] = now_ts
-        await self.get_market_by_slug(slug, use_cache=True, cache_ttl=900)
+        market_data = await self.get_market_by_slug(slug, use_cache=True, cache_ttl=900)
+        token_ids = self._extract_clob_token_ids(market_data)
+        if not token_ids:
+            return None
+
+        current_cost = float(state.get("entry_shares", 0.0)) * float(state.get("entry_price", 0.0))
+        loss_bank_before = max(float(state.get("loss_bank", 0.0)), 0.0)
+        plan = {
+            "slug": slug,
+            "market_data": market_data,
+            "token_ids": token_ids,
+            "prepared_at": now_ts,
+            "win": {
+                "direction": None,
+                "streak": 0,
+                "loss_bank": 0.0,
+                "recovery_target": float(self.martingale_initial_amount),
+            },
+            "loss": {
+                "direction": state.get("direction"),
+                "streak": int(state.get("streak", 0) or 0) + 1,
+                "loss_bank": round(loss_bank_before + current_cost, 4),
+                "recovery_target": round(
+                    loss_bank_before + current_cost + float(self.martingale_initial_amount),
+                    4,
+                ),
+            },
+        }
+        self._martingale_entry_plans[slug] = plan
+        stale_slugs = sorted(
+            self._martingale_entry_plans,
+            key=lambda item: self._martingale_entry_plans[item].get("prepared_at", 0.0),
+        )[:-4]
+        for stale_slug in stale_slugs:
+            self._martingale_entry_plans.pop(stale_slug, None)
+        self.log(
+            f"[Martingale] Next window prepared | slug={slug} | "
+            f"win_target=${plan['win']['recovery_target']:.2f} | "
+            f"loss_target=${plan['loss']['recovery_target']:.2f}"
+        )
+        return plan
 
     def _is_permanent_order_error(self, error_text: str) -> bool:
         lower_error = (error_text or "").lower()
@@ -729,6 +895,8 @@ class CopyTrader:
                     # Verify tools
                     tools = await session.list_tools()
                     self.log(f"Connected to MCP Server. Tools: {[t.name for t in tools.tools]}")
+                    if self.strategy_mode == "martingale":
+                        self._ensure_chainlink_price_feed()
                     
                     while self.running:
                         # Check timer
@@ -772,6 +940,8 @@ class CopyTrader:
             self.log(f"Critical Error in Monitor Loop: {e}")
             self.running = False
         finally:
+            await self._stop_chainlink_price_feed()
+            await self._drain_background_tasks()
             await self._close_http_session()
 
     async def tick(self, session: ClientSession):
@@ -1229,10 +1399,10 @@ class CopyTrader:
                     self.app_state["winning_trades"][slug] = True
 
     async def run_martingale_strategy(self, session: ClientSession):
-        import time
         import datetime
         import random
         
+        self._ensure_chainlink_price_feed()
         now_ts = time.time()
         # Round down to nearest 300s (5 min)
         window_start = int(now_ts // 300) * 300
@@ -1302,18 +1472,15 @@ class CopyTrader:
                     now_ts=now_ts,
                 )
                 if not settled:
-                    assumed_loss = await self._assume_martingale_loss_for_recovery(
-                        state=state,
-                        slug=previous_slug,
-                        start_time=previous_start,
-                        now_ts=now_ts,
-                    )
-                    if not assumed_loss:
+                    if getattr(self, "_last_unresolved_martingale_slug", None) != previous_slug:
                         self.log(
-                            f"[Martingale] Previous window {previous_slug} not officially settled yet "
-                            "(not 0/1). Holding entry for this tick."
+                            f"[Martingale] Previous window {previous_slug} has no exact Chainlink boundary "
+                            "sample or official outcome yet. Holding entry without guessing."
                         )
-                        return
+                        self._last_unresolved_martingale_slug = previous_slug
+                    return
+                self._last_unresolved_martingale_slug = None
+                now_ts = time.time()
             else:
                 return
 
@@ -1334,7 +1501,11 @@ class CopyTrader:
         start_time = market_data['start_time']
         elapsed = now_ts - start_time.timestamp()
         if elapsed >= 285:
-            await self._prefetch_martingale_market(f"btc-updown-5m-{window_start + 300}", now_ts)
+            await self._prepare_martingale_entry_plan(
+                state=state,
+                slug=f"btc-updown-5m-{window_start + 300}",
+                now_ts=now_ts,
+            )
         
         if self.debug_logs:
             self.log(f"[Debug] Market found: {slug} | elapsed={elapsed:.1f}s | entry_done={state['entry_done']}")
@@ -1354,17 +1525,14 @@ class CopyTrader:
             if now_ts < retry_after:
                 return
 
-            markets = market_data.get('markets', [])
-            if not markets: return
-            clob_token_ids = markets[0].get('clobTokenIds', [])
-            if isinstance(clob_token_ids, str):
-                import json
-                try:
-                    clob_token_ids = json.loads(clob_token_ids)
-                except:
-                    clob_token_ids = []
-                    
-            if len(clob_token_ids) != 2: return
+            prepared_plan = self._martingale_entry_plans.get(slug)
+            clob_token_ids = (
+                prepared_plan.get("token_ids", [])
+                if prepared_plan
+                else self._extract_clob_token_ids(market_data)
+            )
+            if len(clob_token_ids) != 2:
+                return
             
             prices = {}
             if state["direction"] in ("Yes", "No"):
