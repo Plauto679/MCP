@@ -242,6 +242,88 @@ def test_unresolved_settlement_does_not_guess_or_mutate_state():
     assert state == before
 
 
+def test_recovery_uses_normal_price_range_after_early_window():
+    trader = make_trader()
+    trader.martingale_entry_end_seconds = 15
+    trader.martingale_min_entry_price = 0.4
+    trader.martingale_max_entry_price = 0.6
+    trader.martingale_recovery_min_entry_price = 0.4
+    trader.martingale_recovery_max_entry_price = 0.6
+    state = {
+        "streak": 2,
+        "loss_bank": 3.0,
+    }
+
+    assert trader._entry_price_bounds(state, elapsed=60) == (0.4, 0.6)
+
+
+def test_recovery_cutoff_preserves_losses_and_direction_for_next_window():
+    trader = make_trader()
+    trader.running = True
+    trader.dry_run = True
+    trader.debug_logs = False
+    trader.poll_interval = 1
+    trader.martingale_entry_start_seconds = 0
+    trader.martingale_entry_end_seconds = 15
+    trader.martingale_recovery_entry_end_seconds = 120
+    trader.martingale_min_entry_price = 0.4
+    trader.martingale_max_entry_price = 0.6
+    trader.martingale_recovery_min_entry_price = 0.4
+    trader.martingale_recovery_max_entry_price = 0.6
+    trader.polymarket_min_market_buy_usd = 1.0
+    trader._ensure_chainlink_price_feed = lambda: None
+    trader.save_state = lambda: None
+
+    current_slug = "btc-updown-5m-1800000300"
+    current_start = datetime.datetime.fromtimestamp(
+        1_800_000_300,
+        datetime.timezone.utc,
+    )
+    market_data = {
+        "start_time": current_start,
+        "markets": [{"clobTokenIds": ["up-token", "down-token"]}],
+    }
+
+    async def get_market_by_slug(slug, **kwargs):
+        assert slug == current_slug
+        return market_data
+
+    async def fetch_buy_price(token_id):
+        raise AssertionError("Price should not be fetched after the recovery cutoff")
+
+    trader.get_market_by_slug = get_market_by_slug
+    trader.fetch_buy_price = fetch_buy_price
+    trader.app_state = {
+        "pending_settlements": [],
+        "martingale_state": {
+            "active_slug": current_slug,
+            "entry_done": False,
+            "streak": 2,
+            "current_amount": 0.0,
+            "direction": "No",
+            "entry_price": 0.0,
+            "target_token_id": None,
+            "entry_shares": 0.0,
+            "loss_bank": 3.0,
+            "entry_retry_after": 0.0,
+            "entry_attempts": 0,
+            "skip_logged": False,
+            "opened_at": None,
+        },
+    }
+
+    with patch("src.orchestrator.time.time", return_value=1_800_000_421):
+        asyncio.run(trader.run_martingale_strategy(session=None))
+
+    state = trader.app_state["martingale_state"]
+    assert state["entry_done"] is False
+    assert state["streak"] == 2
+    assert state["loss_bank"] == 3.0
+    assert state["direction"] == "No"
+    assert state["skip_logged"] is True
+    assert any("Recovery entry missed" in line for line in trader.logs)
+
+
 def test_boundary_settlement_and_next_entry_happen_in_same_tick():
     trader = make_trader()
     trader.running = True
@@ -249,11 +331,11 @@ def test_boundary_settlement_and_next_entry_happen_in_same_tick():
     trader.debug_logs = False
     trader.martingale_entry_start_seconds = 0
     trader.martingale_entry_end_seconds = 15
-    trader.martingale_recovery_entry_end_seconds = 269
+    trader.martingale_recovery_entry_end_seconds = 120
     trader.martingale_min_entry_price = 0.4
     trader.martingale_max_entry_price = 0.6
-    trader.martingale_recovery_min_entry_price = 0.2
-    trader.martingale_recovery_max_entry_price = 0.8
+    trader.martingale_recovery_min_entry_price = 0.4
+    trader.martingale_recovery_max_entry_price = 0.6
     trader.polymarket_min_market_buy_usd = 1.0
     trader._last_unresolved_martingale_slug = None
     trader._ensure_chainlink_price_feed = lambda: None

@@ -75,9 +75,9 @@ class CopyTrader:
         self.martingale_entry_end_seconds = 15
         self.martingale_min_entry_price = 0.40
         self.martingale_max_entry_price = 0.60
-        self.martingale_recovery_entry_end_seconds = 269
-        self.martingale_recovery_min_entry_price = 0.20
-        self.martingale_recovery_max_entry_price = 0.80
+        self.martingale_recovery_entry_end_seconds = 120
+        self.martingale_recovery_min_entry_price = 0.40
+        self.martingale_recovery_max_entry_price = 0.60
         self.martingale_limit_slippage = 0.05
         self.polymarket_min_market_buy_usd = 1.0
         self._task: Optional[asyncio.Task] = None
@@ -774,9 +774,21 @@ class CopyTrader:
                         self.martingale_min_entry_price = 0.40
                     if self.martingale_max_entry_price > 0.60:
                         self.martingale_max_entry_price = 0.60
-                    self.martingale_recovery_entry_end_seconds = min(max(int(self.martingale_recovery_entry_end_seconds), 15), 269)
-                    self.martingale_recovery_min_entry_price = max(float(self.martingale_recovery_min_entry_price), 0.01)
-                    self.martingale_recovery_max_entry_price = min(float(self.martingale_recovery_max_entry_price), 0.80)
+                    self.martingale_recovery_entry_end_seconds = min(
+                        max(int(self.martingale_recovery_entry_end_seconds), 15),
+                        120,
+                    )
+                    self.martingale_recovery_min_entry_price = max(
+                        float(self.martingale_recovery_min_entry_price),
+                        float(self.martingale_min_entry_price),
+                    )
+                    self.martingale_recovery_max_entry_price = min(
+                        float(self.martingale_recovery_max_entry_price),
+                        float(self.martingale_max_entry_price),
+                    )
+                    if self.martingale_recovery_min_entry_price > self.martingale_recovery_max_entry_price:
+                        self.martingale_recovery_min_entry_price = self.martingale_min_entry_price
+                        self.martingale_recovery_max_entry_price = self.martingale_max_entry_price
                     self.app_state["multipliers"] = data.get('multipliers', {})
                     self.app_state["pending_settlements"] = data.get('pending_settlements', [])
                     martingale_state = data.get('martingale_state')
