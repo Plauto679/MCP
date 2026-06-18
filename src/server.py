@@ -1,7 +1,7 @@
 import os
 from mcp.server.fastmcp import FastMCP
 from py_clob_client_v2.client import ClobClient
-from py_clob_client_v2.clob_types import ApiCreds, OrderArgsV2, MarketOrderArgsV2, OrderType
+from py_clob_client_v2.clob_types import ApiCreds, OrderArgsV2, MarketOrderArgsV2, OrderPayload, OrderType
 from dotenv import load_dotenv
 import sys
 from eth_account import Account
@@ -302,6 +302,48 @@ def place_market_order(
             )
         else:
             return f"Error placing market order: {error_msg}"
+
+@mcp.tool()
+def get_order(order_id: str):
+    """
+    Fetch a single CLOB order by ID.
+    """
+    client = get_client()
+    if not POLYMARKET_API_KEY:
+        return "Error: API Keys not configured."
+    try:
+        import json
+
+        resp = client.get_order(str(order_id))
+        if isinstance(resp, dict):
+            return json.dumps(resp, default=str)
+        if hasattr(resp, "__dict__"):
+            return json.dumps(resp.__dict__, default=str)
+        return json.dumps({"raw": str(resp)})
+    except Exception as e:
+        return f"Error fetching order: {str(e)}"
+
+
+@mcp.tool()
+def cancel_order(order_id: str):
+    """
+    Cancel a single CLOB order by ID.
+    """
+    client = get_client()
+    if not POLYMARKET_API_KEY:
+        return "Error: API Keys not configured."
+    try:
+        import json
+
+        resp = client.cancel_order(OrderPayload(orderID=str(order_id)))
+        if isinstance(resp, dict):
+            return json.dumps(resp, default=str)
+        if hasattr(resp, "__dict__"):
+            return json.dumps(resp.__dict__, default=str)
+        return json.dumps({"raw": str(resp)})
+    except Exception as e:
+        return f"Error cancelling order: {str(e)}"
+
 
 @mcp.tool()
 def cancel_all():

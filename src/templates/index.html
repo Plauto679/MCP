@@ -19,6 +19,16 @@
 
         .log-entry {
             margin-bottom: 2px;
+            overflow-wrap: anywhere;
+            white-space: pre-wrap;
+        }
+
+        .log-entry-heartbeat {
+            color: #64748b;
+        }
+
+        .log-paused {
+            color: #fbbf24;
         }
 
         ::-webkit-scrollbar {
@@ -58,15 +68,17 @@
                 <!-- Strategy Selector -->
                 <div class="mb-6">
                     <label class="block text-sm font-medium text-gray-400 mb-2">Strategy Mode</label>
-                    <div class="flex space-x-2 bg-gray-700 p-1 rounded-lg">
+                    <div class="grid grid-cols-2 gap-1 bg-gray-700 p-1 rounded-lg">
                         <button id="btn-mode-copy" onclick="setStrategyMode('copy')"
-                            class="flex-1 py-1 px-3 rounded-md text-sm font-bold bg-blue-600 text-white shadow-sm transition-all duration-200">Copy
+                            class="py-1 px-3 rounded-md text-sm font-bold bg-blue-600 text-white shadow-sm transition-all duration-200">Copy
                             Trading</button>
                         <button id="btn-mode-winning" onclick="setStrategyMode('winning')"
-                            class="flex-1 py-1 px-3 rounded-md text-sm font-bold text-gray-400 hover:text-white hover:bg-gray-600 transition-all duration-200">Winning
+                            class="py-1 px-3 rounded-md text-sm font-bold text-gray-400 hover:text-white hover:bg-gray-600 transition-all duration-200">Winning
                             .75</button>
                         <button id="btn-mode-martingale" onclick="setStrategyMode('martingale')"
-                            class="flex-1 py-1 px-3 rounded-md text-sm font-bold text-gray-400 hover:text-white hover:bg-gray-600 transition-all duration-200">Martingale</button>
+                            class="py-1 px-3 rounded-md text-sm font-bold text-gray-400 hover:text-white hover:bg-gray-600 transition-all duration-200">Martingale</button>
+                        <button id="btn-mode-martingale-maker" onclick="setStrategyMode('martingale_maker')"
+                            class="py-1 px-3 rounded-md text-sm font-bold text-gray-400 hover:text-white hover:bg-gray-600 transition-all duration-200">Martingale Maker</button>
                     </div>
                     <input type="hidden" id="strategy-mode" value="{{ strategy_mode }}">
                 </div>
@@ -193,6 +205,52 @@
                     </div>
                 </div>
 
+                <!-- === SECTION: MARTINGALE MAKER STRATEGY === -->
+                <div id="section-martingale-maker" class="hidden">
+                    <div class="bg-gray-750 p-4 rounded border border-gray-600 mb-6">
+                        <div class="flex items-center justify-between mb-4 border-b border-gray-600 pb-2">
+                            <h3 class="text-sm font-medium text-gray-300">Martingale Maker Logic</h3>
+                        </div>
+
+                        <div class="space-y-3">
+                            <div>
+                                <label class="block text-xs text-gray-500 uppercase">Initial Amount ($)</label>
+                                <input type="number" step="0.01" id="martingale-maker-initial-amount"
+                                    value="{{ martingale_initial_amount }}"
+                                    class="mt-1 block w-full bg-gray-700 border border-gray-600 rounded-md shadow-sm py-2 px-3 text-white">
+                            </div>
+                            <div class="grid grid-cols-2 gap-3">
+                                <div>
+                                    <label class="block text-xs text-gray-500 uppercase">Maker Wait (s)</label>
+                                    <input type="number" step="0.1" id="martingale-maker-wait-seconds"
+                                        value="{{ martingale_maker_wait_seconds }}"
+                                        class="mt-1 block w-full bg-gray-700 border border-gray-600 rounded-md shadow-sm py-2 px-3 text-white">
+                                </div>
+                                <div>
+                                    <label class="block text-xs text-gray-500 uppercase">Price Offset</label>
+                                    <input type="number" step="0.01" id="martingale-maker-price-offset"
+                                        value="{{ martingale_maker_price_offset }}"
+                                        class="mt-1 block w-full bg-gray-700 border border-gray-600 rounded-md shadow-sm py-2 px-3 text-white">
+                                </div>
+                            </div>
+                            <div class="grid grid-cols-2 gap-3">
+                                <div>
+                                    <label class="block text-xs text-gray-500 uppercase">Sample (s)</label>
+                                    <input type="number" step="0.1" id="martingale-maker-sample-seconds"
+                                        value="{{ martingale_maker_sample_seconds }}"
+                                        class="mt-1 block w-full bg-gray-700 border border-gray-600 rounded-md shadow-sm py-2 px-3 text-white">
+                                </div>
+                                <div>
+                                    <label class="block text-xs text-gray-500 uppercase">Record (s)</label>
+                                    <input type="number" step="1" id="martingale-maker-record-seconds"
+                                        value="{{ martingale_maker_record_seconds }}"
+                                        class="mt-1 block w-full bg-gray-700 border border-gray-600 rounded-md shadow-sm py-2 px-3 text-white">
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+
                 <!-- Common Settings -->
                 <div class="grid grid-cols-2 gap-4 mb-6">
                     <div>
@@ -241,9 +299,14 @@
 
             <!-- COLUMN 3: Live Logs (50%) -->
             <div class="w-1/2 bg-gray-900 rounded-lg border border-gray-700 flex flex-col h-full">
-                <div class="bg-gray-800 p-3 rounded-t-lg border-b border-gray-700 flex justify-between items-center">
+                <div class="bg-gray-800 p-3 rounded-t-lg border-b border-gray-700 flex justify-between items-center gap-3">
                     <h2 class="font-mono font-bold text-gray-300">>_ Terminal Output</h2>
-                    <span class="text-xs text-green-500 font-mono">● Live</span>
+                    <div class="flex items-center gap-3 text-xs font-mono">
+                        <span id="log-count" class="text-gray-500">0 lines</span>
+                        <button id="log-jump" onclick="jumpToLatest()"
+                            class="hidden text-blue-300 hover:text-blue-200">Latest</button>
+                        <span class="text-green-500">Live</span>
+                    </div>
                 </div>
                 <div id="terminal"
                     class="terminal font-mono text-sm flex-1 bg-[#1a1b26] p-4 overflow-y-auto rounded-b-lg">
@@ -258,6 +321,11 @@
     <script>
         const ws = new WebSocket(`ws://${window.location.host}/ws/logs`);
         const terminal = document.getElementById('terminal');
+        const logCount = document.getElementById('log-count');
+        const logJump = document.getElementById('log-jump');
+        const MAX_VISIBLE_LOGS = 160;
+        let lastLogSnapshot = '';
+        let autoFollowLogs = true;
         let isRunning = {{ 'true' if running else 'false' }};
         let historyData = [];
         // Parse python list of wallets to JS array
@@ -313,25 +381,31 @@
             const btnCopy = document.getElementById('btn-mode-copy');
             const btnWin = document.getElementById('btn-mode-winning');
             const btnMartingale = document.getElementById('btn-mode-martingale');
+            const btnMartingaleMaker = document.getElementById('btn-mode-martingale-maker');
 
             // Reset all to unselected
-            const unselectedClass = "flex-1 py-1 px-3 rounded-md text-sm font-bold text-gray-400 hover:text-white hover:bg-gray-600 transition-all duration-200";
+            const unselectedClass = "py-1 px-3 rounded-md text-sm font-bold text-gray-400 hover:text-white hover:bg-gray-600 transition-all duration-200";
             btnCopy.className = unselectedClass;
             btnWin.className = unselectedClass;
             btnMartingale.className = unselectedClass;
+            btnMartingaleMaker.className = unselectedClass;
 
             document.getElementById('section-copy').classList.add('hidden');
             document.getElementById('section-winning').classList.add('hidden');
             document.getElementById('section-martingale').classList.add('hidden');
+            document.getElementById('section-martingale-maker').classList.add('hidden');
 
             if (mode === 'winning') {
-                btnWin.className = "flex-1 py-1 px-3 rounded-md text-sm font-bold bg-green-600 text-white shadow-sm transition-all duration-200";
+                btnWin.className = "py-1 px-3 rounded-md text-sm font-bold bg-green-600 text-white shadow-sm transition-all duration-200";
                 document.getElementById('section-winning').classList.remove('hidden');
             } else if (mode === 'martingale') {
-                btnMartingale.className = "flex-1 py-1 px-3 rounded-md text-sm font-bold bg-purple-600 text-white shadow-sm transition-all duration-200";
+                btnMartingale.className = "py-1 px-3 rounded-md text-sm font-bold bg-purple-600 text-white shadow-sm transition-all duration-200";
                 document.getElementById('section-martingale').classList.remove('hidden');
+            } else if (mode === 'martingale_maker') {
+                btnMartingaleMaker.className = "py-1 px-3 rounded-md text-sm font-bold bg-fuchsia-600 text-white shadow-sm transition-all duration-200";
+                document.getElementById('section-martingale-maker').classList.remove('hidden');
             } else { // default to copy
-                btnCopy.className = "flex-1 py-1 px-3 rounded-md text-sm font-bold bg-blue-600 text-white shadow-sm transition-all duration-200";
+                btnCopy.className = "py-1 px-3 rounded-md text-sm font-bold bg-blue-600 text-white shadow-sm transition-all duration-200";
                 document.getElementById('section-copy').classList.remove('hidden');
             }
         }
@@ -367,13 +441,91 @@
             }
         }
 
-        ws.onmessage = function (event) {
-            const div = document.createElement('div');
-            div.className = 'log-entry';
-            div.textContent = `> ${event.data}`;
-            terminal.appendChild(div);
+        function isTerminalNearBottom() {
+            return terminal.scrollHeight - terminal.scrollTop - terminal.clientHeight < 48;
+        }
+
+        function updateLogControls(visibleCount = terminal.children.length) {
+            if (logCount) logCount.innerText = `${visibleCount} lines`;
+            if (logJump) {
+                logJump.classList.toggle('hidden', autoFollowLogs);
+                logJump.classList.toggle('log-paused', !autoFollowLogs);
+            }
+        }
+
+        function jumpToLatest() {
+            autoFollowLogs = true;
             terminal.scrollTop = terminal.scrollHeight;
+            updateLogControls();
+        }
+
+        function logClassName(message) {
+            return message.includes('[Heartbeat]')
+                ? 'log-entry log-entry-heartbeat'
+                : 'log-entry';
+        }
+
+        function displayLogMessage(message) {
+            return message.replace(/\s+\|\s+logs=\d+/g, '');
+        }
+
+        function renderLogSnapshot(logs) {
+            const visibleLogs = logs.slice(-MAX_VISIBLE_LOGS);
+            const snapshot = visibleLogs.join('\n');
+            if (snapshot === lastLogSnapshot) return;
+
+            const shouldFollow = autoFollowLogs || isTerminalNearBottom();
+            terminal.innerHTML = '';
+            visibleLogs.forEach((message) => {
+                const div = document.createElement('div');
+                div.className = logClassName(message);
+                div.textContent = `> ${displayLogMessage(message)}`;
+                terminal.appendChild(div);
+            });
+            lastLogSnapshot = snapshot;
+            if (shouldFollow) jumpToLatest();
+            updateLogControls(visibleLogs.length);
+        }
+
+        function appendLog(message) {
+            const shouldFollow = autoFollowLogs || isTerminalNearBottom();
+            const waiting = terminal.querySelector('.text-gray-500');
+            if (waiting && waiting.textContent.includes('Waiting for logs')) {
+                waiting.remove();
+            }
+
+            const div = document.createElement('div');
+            div.className = logClassName(message);
+            div.textContent = `> ${displayLogMessage(message)}`;
+            terminal.appendChild(div);
+            while (terminal.children.length > MAX_VISIBLE_LOGS) {
+                terminal.removeChild(terminal.firstElementChild);
+            }
+            if (shouldFollow) jumpToLatest();
+            updateLogControls();
+        }
+
+        async function refreshLogSnapshot() {
+            try {
+                const response = await fetch('/api/logs');
+                const data = await response.json();
+                renderLogSnapshot(data.logs || []);
+            } catch (error) {
+                // The websocket can still stream logs if this short poll fails.
+            }
+        }
+
+        terminal.addEventListener('scroll', () => {
+            autoFollowLogs = isTerminalNearBottom();
+            updateLogControls();
+        });
+
+        ws.onmessage = function (event) {
+            appendLog(event.data);
         };
+
+        refreshLogSnapshot();
+        setInterval(refreshLogSnapshot, 1000);
 
         async function saveConfig() {
             // Collect all wallet inputs
@@ -393,7 +545,15 @@
                 strategy_mode: document.getElementById('strategy-mode').value,
                 winning_size_mode: document.getElementById('winning-size-mode').value,
                 winning_size_value: parseFloat(document.getElementById('winning-size-value').value),
-                martingale_initial_amount: parseFloat(document.getElementById('martingale-initial-amount').value)
+                martingale_initial_amount: parseFloat(
+                    document.getElementById('strategy-mode').value === 'martingale_maker'
+                        ? document.getElementById('martingale-maker-initial-amount').value
+                        : document.getElementById('martingale-initial-amount').value
+                ),
+                martingale_maker_wait_seconds: parseFloat(document.getElementById('martingale-maker-wait-seconds').value),
+                martingale_maker_price_offset: parseFloat(document.getElementById('martingale-maker-price-offset').value),
+                martingale_maker_sample_seconds: parseFloat(document.getElementById('martingale-maker-sample-seconds').value),
+                martingale_maker_record_seconds: parseFloat(document.getElementById('martingale-maker-record-seconds').value)
             };
 
             try {
@@ -467,6 +627,9 @@
                 } else if (item.strategy_mode === 'martingale') {
                     modeLabel = 'MARTINGALE';
                     modeColor = 'text-purple-400';
+                } else if (item.strategy_mode === 'martingale_maker') {
+                    modeLabel = 'M-MAKER';
+                    modeColor = 'text-fuchsia-400';
                 }
 
                 // Truncate wallet for display (show first wallet count) or Strategy info
@@ -475,6 +638,8 @@
                     subTitle = `Entry: ${item.winning_entry_time}m`;
                 } else if (item.strategy_mode === 'martingale') {
                     subTitle = `Initial: $${item.martingale_initial_amount}`;
+                } else if (item.strategy_mode === 'martingale_maker') {
+                    subTitle = `Initial: $${item.martingale_initial_amount} | Maker ${item.martingale_maker_wait_seconds || 5}s`;
                 } else {
                     const walletCount = item.target_wallets ? item.target_wallets.length : (item.target_wallet ? 1 : 0);
                     subTitle = walletCount > 1 ? `${walletCount} Wallets` : (item.target_wallets?.[0] || item.target_wallet || "Unknown").substring(0, 6) + '...';
@@ -531,6 +696,14 @@
                 if (item.martingale_initial_amount !== undefined) {
                     document.getElementById('martingale-initial-amount').value = item.martingale_initial_amount;
                 }
+            } else if (mode === 'martingale_maker') {
+                if (item.martingale_initial_amount !== undefined) {
+                    document.getElementById('martingale-maker-initial-amount').value = item.martingale_initial_amount;
+                }
+                document.getElementById('martingale-maker-wait-seconds').value = item.martingale_maker_wait_seconds || 5.0;
+                document.getElementById('martingale-maker-price-offset').value = item.martingale_maker_price_offset || 0.01;
+                document.getElementById('martingale-maker-sample-seconds').value = item.martingale_maker_sample_seconds || 0.5;
+                document.getElementById('martingale-maker-record-seconds').value = item.martingale_maker_record_seconds || 15.0;
             }
 
             // Optional: Auto-save on restore? Or let user click save? 
