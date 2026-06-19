@@ -9,6 +9,10 @@ import os
 from .orchestrator import CopyTrader
 
 app = FastAPI(title="Polymarket Copy Trader Dashboard")
+try:
+    LOG_SNAPSHOT_LIMIT = min(max(int(os.getenv("DASHBOARD_LOG_SNAPSHOT_LIMIT", "500")), 120), 5000)
+except ValueError:
+    LOG_SNAPSHOT_LIMIT = 500
 
 # Initialize Trader with defaults (will be updated via UI)
 # Using a default target if not set in environment
@@ -38,6 +42,8 @@ class ConfigUpdate(BaseModel):
     martingale_maker_price_offset: float = 0.01
     martingale_maker_sample_seconds: float = 0.5
     martingale_maker_record_seconds: float = 15.0
+    martingale_maker_blind_price: float = 0.50
+    martingale_maker_blind_end_seconds: float = 15.0
 
 class StartRequest(BaseModel):
     duration: Optional[int] = None
@@ -68,6 +74,8 @@ async def read_root(request: Request):
         "martingale_maker_price_offset": getattr(trader, "martingale_maker_price_offset", 0.01),
         "martingale_maker_sample_seconds": getattr(trader, "martingale_maker_sample_seconds", 0.5),
         "martingale_maker_record_seconds": getattr(trader, "martingale_maker_record_seconds", 15.0),
+        "martingale_maker_blind_price": getattr(trader, "martingale_maker_blind_price", 0.50),
+        "martingale_maker_blind_end_seconds": getattr(trader, "martingale_maker_blind_end_seconds", 15.0),
         "running": trader.running
     })
 
@@ -106,7 +114,9 @@ async def update_config(config: ConfigUpdate):
         martingale_maker_wait_seconds=config.martingale_maker_wait_seconds,
         martingale_maker_price_offset=config.martingale_maker_price_offset,
         martingale_maker_sample_seconds=config.martingale_maker_sample_seconds,
-        martingale_maker_record_seconds=config.martingale_maker_record_seconds
+        martingale_maker_record_seconds=config.martingale_maker_record_seconds,
+        martingale_maker_blind_price=config.martingale_maker_blind_price,
+        martingale_maker_blind_end_seconds=config.martingale_maker_blind_end_seconds
     )
     # Restart if running to apply new interval effectively in the loop
     if trader.running:
@@ -116,7 +126,12 @@ async def update_config(config: ConfigUpdate):
 
 @app.get("/api/logs")
 async def get_logs():
-    return {"logs": trader.logs[-120:]}
+    return {
+        "logs": trader.logs[-LOG_SNAPSHOT_LIMIT:],
+        "total": getattr(trader, "log_total_count", len(trader.logs)),
+        "buffer": len(trader.logs),
+        "buffer_limit": getattr(trader, "log_buffer_limit", LOG_SNAPSHOT_LIMIT),
+    }
 
 @app.get("/api/history")
 async def get_history():
@@ -128,7 +143,7 @@ async def websocket_endpoint(websocket: WebSocket):
     try:
         last_snapshot = []
         while True:
-            snapshot = trader.logs[-120:]
+            snapshot = trader.logs[-LOG_SNAPSHOT_LIMIT:]
             if snapshot != last_snapshot:
                 start_index = 0
                 max_overlap = min(len(last_snapshot), len(snapshot))

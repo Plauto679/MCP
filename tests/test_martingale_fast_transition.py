@@ -46,8 +46,11 @@ def make_trader():
     trader.martingale_maker_price_offset = 0.01
     trader.martingale_maker_sample_seconds = 0.5
     trader.martingale_maker_record_seconds = 15.0
+    trader.martingale_maker_blind_price = 0.50
+    trader.martingale_maker_blind_end_seconds = 15.0
     trader.data_dir = "."
     trader.polymarket_min_market_buy_usd = 1.0
+    trader.polymarket_min_limit_order_shares = 5.0
     trader.dry_run = True
     return trader
 
@@ -685,7 +688,7 @@ def test_martingale_maker_dry_run_simulates_maker_fill_on_touch():
             token_ids=["up-token", "down-token"],
             target_token_id="up-token",
             entry_price=0.52,
-            usd_to_buy=1.0,
+            usd_to_buy=3.0,
             min_entry_price=0.4,
             max_entry_price=0.6,
         )
@@ -698,6 +701,192 @@ def test_martingale_maker_dry_run_simulates_maker_fill_on_touch():
     assert result["entry_fee_usd"] == 0.0
     assert any(filename == "martingale_maker_orderbook_samples.csv" for filename, _ in rows)
     assert any(filename == "martingale_maker_entry_events.csv" for filename, _ in rows)
+
+
+def test_martingale_maker_blind_probe_can_fill_without_taker_price():
+    trader = make_trader()
+    trader.strategy_mode = "martingale_maker"
+    trader.dry_run = True
+    trader.martingale_maker_blind_end_seconds = 0.05
+    trader.martingale_maker_sample_seconds = 0.01
+    trader._schedule_csv_row = lambda *_args, **_kwargs: None
+    trader.fetch_buy_price = lambda _token_id: asyncio.sleep(0, result=0.0)
+
+    async def fetch_order_book(token_id):
+        if token_id == "up-token":
+            return {
+                "bids": [{"price": "0.49", "size": "100"}],
+                "asks": [{"price": "0.50", "size": "10"}],
+            }
+        return {
+            "bids": [{"price": "0.49", "size": "100"}],
+            "asks": [{"price": "0.52", "size": "100"}],
+        }
+
+    trader.fetch_order_book = fetch_order_book
+
+    result = asyncio.run(
+        trader._try_maker_entry_probe(
+            session=None,
+            slug="btc-updown-5m-1800000000",
+            start_time=datetime.datetime.fromtimestamp(
+                1_800_000_000,
+                datetime.timezone.utc,
+            ),
+            elapsed=0.0,
+            entry_end_seconds=15,
+            state={"direction": "Yes"},
+            token_ids=["up-token", "down-token"],
+            target_token_id="up-token",
+            entry_price=0.0,
+            usd_to_buy=3.0,
+            min_entry_price=0.4,
+            max_entry_price=0.6,
+            blind=True,
+        )
+    )
+
+    assert result["attempted"] is True
+    assert result["blind"] is True
+    assert result["filled"] is True
+    assert result["fallback"] is False
+    assert result["avg_entry_price"] == 0.5
+    assert result["entry_fee_usd"] == 0.0
+
+
+def test_martingale_maker_blind_probe_waits_when_taker_price_stays_missing():
+    trader = make_trader()
+    trader.strategy_mode = "martingale_maker"
+    trader.dry_run = True
+    trader.martingale_maker_blind_end_seconds = 0.02
+    trader.martingale_maker_sample_seconds = 0.01
+    trader._schedule_csv_row = lambda *_args, **_kwargs: None
+    trader.fetch_buy_price = lambda _token_id: asyncio.sleep(0, result=0.0)
+
+    async def fetch_order_book(_token_id):
+        return {
+            "bids": [{"price": "0.30", "size": "100"}],
+            "asks": [{"price": "0.80", "size": "100"}],
+        }
+
+    trader.fetch_order_book = fetch_order_book
+
+    result = asyncio.run(
+        trader._try_maker_entry_probe(
+            session=None,
+            slug="btc-updown-5m-1800000000",
+            start_time=datetime.datetime.fromtimestamp(
+                1_800_000_000,
+                datetime.timezone.utc,
+            ),
+            elapsed=0.0,
+            entry_end_seconds=15,
+            state={"direction": "Yes"},
+            token_ids=["up-token", "down-token"],
+            target_token_id="up-token",
+            entry_price=0.0,
+            usd_to_buy=3.0,
+            min_entry_price=0.4,
+            max_entry_price=0.6,
+            blind=True,
+        )
+    )
+
+    assert result["attempted"] is True
+    assert result["blind"] is True
+    assert result["filled"] is False
+    assert result["fallback_entry_price"] is None
+    assert any("taker price is still unavailable" in line for line in trader.logs)
+
+
+def test_martingale_maker_blind_probe_uses_taker_fallback_when_price_appears():
+    trader = make_trader()
+    trader.strategy_mode = "martingale_maker"
+    trader.dry_run = True
+    trader.martingale_maker_blind_end_seconds = 0.05
+    trader.martingale_maker_sample_seconds = 0.01
+    trader._schedule_csv_row = lambda *_args, **_kwargs: None
+
+    async def fetch_order_book(_token_id):
+        return {
+            "bids": [{"price": "0.30", "size": "100"}],
+            "asks": [{"price": "0.80", "size": "100"}],
+        }
+
+    async def fetch_buy_price(_token_id):
+        return 0.49
+
+    trader.fetch_order_book = fetch_order_book
+    trader.fetch_buy_price = fetch_buy_price
+
+    result = asyncio.run(
+        trader._try_maker_entry_probe(
+            session=None,
+            slug="btc-updown-5m-1800000000",
+            start_time=datetime.datetime.fromtimestamp(
+                1_800_000_000,
+                datetime.timezone.utc,
+            ),
+            elapsed=0.0,
+            entry_end_seconds=15,
+            state={"direction": "Yes"},
+            token_ids=["up-token", "down-token"],
+            target_token_id="up-token",
+            entry_price=0.0,
+            usd_to_buy=3.0,
+            min_entry_price=0.4,
+            max_entry_price=0.6,
+            blind=True,
+        )
+    )
+
+    assert result["attempted"] is True
+    assert result["filled"] is False
+    assert result["fallback_entry_price"] == 0.49
+    assert any("using normal fallback" in line for line in trader.logs)
+
+
+def test_martingale_maker_skips_maker_when_limit_size_is_too_small():
+    trader = make_trader()
+    trader.strategy_mode = "martingale_maker"
+    trader.dry_run = False
+    trader.martingale_maker_wait_seconds = 5.0
+    rows = []
+    trader._schedule_csv_row = lambda filename, row: rows.append((filename, row))
+
+    async def fetch_order_book(_token_id):
+        return {
+            "bids": [{"price": "0.47", "size": "100"}],
+            "asks": [{"price": "0.50", "size": "100"}],
+        }
+
+    trader.fetch_order_book = fetch_order_book
+
+    result = asyncio.run(
+        trader._try_maker_entry_probe(
+            session=None,
+            slug="btc-updown-5m-1800000000",
+            start_time=datetime.datetime.fromtimestamp(
+                1_800_000_000,
+                datetime.timezone.utc,
+            ),
+            elapsed=0.0,
+            entry_end_seconds=265,
+            state={"direction": "No"},
+            token_ids=["up-token", "down-token"],
+            target_token_id="down-token",
+            entry_price=0.48,
+            usd_to_buy=1.0,
+            min_entry_price=0.4,
+            max_entry_price=0.6,
+        )
+    )
+
+    assert result["attempted"] is False
+    assert result["filled"] is False
+    assert result["route"] == "taker_maker_min_size"
+    assert any("below min=5.00" in line for line in trader.logs)
+    assert rows[-1][1]["route"] == "taker_maker_min_size"
 
 
 def test_martingale_maker_live_places_post_only_and_detects_fill():
@@ -730,7 +919,7 @@ def test_martingale_maker_live_places_post_only_and_detects_fill():
                 return SimpleNamespace(content=[SimpleNamespace(text=json.dumps({
                     "id": "0xmaker",
                     "status": "filled",
-                    "size_matched": "2.0",
+                    "size_matched": "6.0",
                     "price": "0.50",
                 }))])
             raise AssertionError(f"unexpected tool {name}")
@@ -749,7 +938,7 @@ def test_martingale_maker_live_places_post_only_and_detects_fill():
             token_ids=["up-token", "down-token"],
             target_token_id="up-token",
             entry_price=0.5,
-            usd_to_buy=1.0,
+            usd_to_buy=3.0,
             min_entry_price=0.4,
             max_entry_price=0.6,
         )
@@ -759,7 +948,7 @@ def test_martingale_maker_live_places_post_only_and_detects_fill():
     assert result["filled"] is True
     assert result["fallback"] is False
     assert result["route"] == "maker_live"
-    assert result["filled_usd"] == pytest.approx(1.0)
+    assert result["filled_usd"] == pytest.approx(3.0)
     assert result["entry_fee_usd"] == 0.0
     place_call = calls[0]
     assert place_call[0] == "place_order"
@@ -818,7 +1007,7 @@ def test_martingale_maker_live_cancels_unfilled_order_for_taker_fallback():
             token_ids=["up-token", "down-token"],
             target_token_id="up-token",
             entry_price=0.5,
-            usd_to_buy=1.0,
+            usd_to_buy=3.0,
             min_entry_price=0.4,
             max_entry_price=0.6,
         )
@@ -879,7 +1068,7 @@ def test_martingale_maker_live_partial_fill_reports_remaining():
             token_ids=["up-token", "down-token"],
             target_token_id="up-token",
             entry_price=0.5,
-            usd_to_buy=1.0,
+            usd_to_buy=3.0,
             min_entry_price=0.4,
             max_entry_price=0.6,
         )
@@ -890,4 +1079,4 @@ def test_martingale_maker_live_partial_fill_reports_remaining():
     assert result["fallback"] is True
     assert result["route"] == "maker_partial"
     assert result["filled_usd"] == pytest.approx(0.5)
-    assert result["remaining_usd"] == pytest.approx(0.5)
+    assert result["remaining_usd"] == pytest.approx(2.5)

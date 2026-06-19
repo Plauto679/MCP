@@ -247,6 +247,20 @@
                                         class="mt-1 block w-full bg-gray-700 border border-gray-600 rounded-md shadow-sm py-2 px-3 text-white">
                                 </div>
                             </div>
+                            <div class="grid grid-cols-2 gap-3">
+                                <div>
+                                    <label class="block text-xs text-gray-500 uppercase">Blind Price</label>
+                                    <input type="number" step="0.01" id="martingale-maker-blind-price"
+                                        value="{{ martingale_maker_blind_price }}"
+                                        class="mt-1 block w-full bg-gray-700 border border-gray-600 rounded-md shadow-sm py-2 px-3 text-white">
+                                </div>
+                                <div>
+                                    <label class="block text-xs text-gray-500 uppercase">Blind End (s)</label>
+                                    <input type="number" step="1" id="martingale-maker-blind-end-seconds"
+                                        value="{{ martingale_maker_blind_end_seconds }}"
+                                        class="mt-1 block w-full bg-gray-700 border border-gray-600 rounded-md shadow-sm py-2 px-3 text-white">
+                                </div>
+                            </div>
                         </div>
                     </div>
                 </div>
@@ -323,8 +337,9 @@
         const terminal = document.getElementById('terminal');
         const logCount = document.getElementById('log-count');
         const logJump = document.getElementById('log-jump');
-        const MAX_VISIBLE_LOGS = 160;
+        const MAX_VISIBLE_LOGS = 500;
         let lastLogSnapshot = '';
+        let lastLogTotal = null;
         let autoFollowLogs = true;
         let isRunning = {{ 'true' if running else 'false' }};
         let historyData = [];
@@ -445,8 +460,12 @@
             return terminal.scrollHeight - terminal.scrollTop - terminal.clientHeight < 48;
         }
 
-        function updateLogControls(visibleCount = terminal.children.length) {
-            if (logCount) logCount.innerText = `${visibleCount} lines`;
+        function updateLogControls(visibleCount = terminal.children.length, totalCount = lastLogTotal) {
+            if (logCount) {
+                logCount.innerText = totalCount && totalCount > visibleCount
+                    ? `${visibleCount}/${totalCount} lines`
+                    : `${visibleCount} lines`;
+            }
             if (logJump) {
                 logJump.classList.toggle('hidden', autoFollowLogs);
                 logJump.classList.toggle('log-paused', !autoFollowLogs);
@@ -469,9 +488,10 @@
             return message.replace(/\s+\|\s+logs=\d+/g, '');
         }
 
-        function renderLogSnapshot(logs) {
+        function renderLogSnapshot(logs, totalCount = null) {
             const visibleLogs = logs.slice(-MAX_VISIBLE_LOGS);
             const snapshot = visibleLogs.join('\n');
+            lastLogTotal = totalCount;
             if (snapshot === lastLogSnapshot) return;
 
             const shouldFollow = autoFollowLogs || isTerminalNearBottom();
@@ -484,7 +504,7 @@
             });
             lastLogSnapshot = snapshot;
             if (shouldFollow) jumpToLatest();
-            updateLogControls(visibleLogs.length);
+            updateLogControls(visibleLogs.length, totalCount);
         }
 
         function appendLog(message) {
@@ -509,7 +529,7 @@
             try {
                 const response = await fetch('/api/logs');
                 const data = await response.json();
-                renderLogSnapshot(data.logs || []);
+                renderLogSnapshot(data.logs || [], data.total || null);
             } catch (error) {
                 // The websocket can still stream logs if this short poll fails.
             }
@@ -553,7 +573,9 @@
                 martingale_maker_wait_seconds: parseFloat(document.getElementById('martingale-maker-wait-seconds').value),
                 martingale_maker_price_offset: parseFloat(document.getElementById('martingale-maker-price-offset').value),
                 martingale_maker_sample_seconds: parseFloat(document.getElementById('martingale-maker-sample-seconds').value),
-                martingale_maker_record_seconds: parseFloat(document.getElementById('martingale-maker-record-seconds').value)
+                martingale_maker_record_seconds: parseFloat(document.getElementById('martingale-maker-record-seconds').value),
+                martingale_maker_blind_price: parseFloat(document.getElementById('martingale-maker-blind-price').value),
+                martingale_maker_blind_end_seconds: parseFloat(document.getElementById('martingale-maker-blind-end-seconds').value)
             };
 
             try {
@@ -639,7 +661,7 @@
                 } else if (item.strategy_mode === 'martingale') {
                     subTitle = `Initial: $${item.martingale_initial_amount}`;
                 } else if (item.strategy_mode === 'martingale_maker') {
-                    subTitle = `Initial: $${item.martingale_initial_amount} | Maker ${item.martingale_maker_wait_seconds || 5}s`;
+                    subTitle = `Init $${item.martingale_initial_amount} | M ${item.martingale_maker_wait_seconds || 5}s | B ${item.martingale_maker_blind_end_seconds || 15}s`;
                 } else {
                     const walletCount = item.target_wallets ? item.target_wallets.length : (item.target_wallet ? 1 : 0);
                     subTitle = walletCount > 1 ? `${walletCount} Wallets` : (item.target_wallets?.[0] || item.target_wallet || "Unknown").substring(0, 6) + '...';
@@ -704,6 +726,8 @@
                 document.getElementById('martingale-maker-price-offset').value = item.martingale_maker_price_offset || 0.01;
                 document.getElementById('martingale-maker-sample-seconds').value = item.martingale_maker_sample_seconds || 0.5;
                 document.getElementById('martingale-maker-record-seconds').value = item.martingale_maker_record_seconds || 15.0;
+                document.getElementById('martingale-maker-blind-price').value = item.martingale_maker_blind_price || 0.5;
+                document.getElementById('martingale-maker-blind-end-seconds').value = item.martingale_maker_blind_end_seconds || 15.0;
             }
 
             // Optional: Auto-save on restore? Or let user click save? 

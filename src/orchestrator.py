@@ -50,6 +50,11 @@ class CopyTrader:
         }
         self.initial_sync_complete = False
         self.logs: List[str] = []
+        try:
+            self.log_buffer_limit = min(max(int(os.getenv("LOG_BUFFER_LIMIT", "5000")), 300), 50000)
+        except ValueError:
+            self.log_buffer_limit = 5000
+        self.log_total_count = 0
         self._active_events_failures = 0
         self._last_active_events_warn_ts: Optional[float] = None
         self._last_heartbeat_ts: Optional[float] = None
@@ -62,6 +67,7 @@ class CopyTrader:
         self._martingale_prefetch_attempts = {}
         self._martingale_entry_plans = {}
         self._martingale_maker_recorder_tasks = {}
+        self._martingale_maker_recorder_context = {}
         self._chainlink_price_samples = {}
         self._chainlink_feed_task: Optional[asyncio.Task] = None
         self._chainlink_connected = False
@@ -98,8 +104,12 @@ class CopyTrader:
         self.martingale_maker_price_offset = 0.01
         self.martingale_maker_sample_seconds = 0.5
         self.martingale_maker_record_seconds = 15.0
+        self.martingale_maker_blind_price = 0.50
+        self.martingale_maker_blind_end_seconds = 15.0
         self.polymarket_min_market_buy_usd = 1.0
+        self.polymarket_min_limit_order_shares = 5.0
         self.data_dir = os.path.join(os.path.dirname(__file__), "..", "data")
+        self.runtime_log_file = os.path.join(self.data_dir, "runtime.log")
         self._task: Optional[asyncio.Task] = None
         
         # Persistence
@@ -1033,14 +1043,34 @@ class CopyTrader:
                 elapsed = time.time() - float(start_ts)
                 if elapsed > record_seconds:
                     break
-                await self._record_maker_orderbook_snapshot(slug, start_ts, token_ids)
+                context = self._martingale_maker_recorder_context.get(slug, {})
+                await self._record_maker_orderbook_snapshot(
+                    slug,
+                    start_ts,
+                    token_ids,
+                    target_direction=context.get("target_direction"),
+                    maker_price=context.get("maker_price"),
+                )
                 await asyncio.sleep(sample_seconds)
         finally:
             self._martingale_maker_recorder_tasks.pop(slug, None)
+            self._martingale_maker_recorder_context.pop(slug, None)
 
-    def _ensure_maker_orderbook_recorder(self, slug: str, start_ts: float, token_ids: List[str]):
+    def _ensure_maker_orderbook_recorder(
+        self,
+        slug: str,
+        start_ts: float,
+        token_ids: List[str],
+        target_direction: Optional[str] = None,
+        maker_price: Optional[float] = None,
+    ):
         if not self._is_martingale_maker_mode() or len(token_ids) != 2:
             return
+        context = self._martingale_maker_recorder_context.setdefault(slug, {})
+        if target_direction in ("Yes", "No"):
+            context["target_direction"] = target_direction
+        if maker_price is not None:
+            context["maker_price"] = maker_price
         existing = self._martingale_maker_recorder_tasks.get(slug)
         if existing and not existing.done():
             return
@@ -1051,6 +1081,20 @@ class CopyTrader:
 
     def _record_maker_entry_event(self, row: Dict):
         self._schedule_csv_row("martingale_maker_entry_events.csv", row)
+
+    def _blind_maker_price(self, min_entry_price: float, max_entry_price: float) -> float:
+        configured = float(getattr(self, "martingale_maker_blind_price", 0.50) or 0.50)
+        configured = min(max(configured, float(min_entry_price)), float(max_entry_price))
+        return round(configured, 2)
+
+    def _can_try_blind_maker(self, elapsed: float, entry_end_seconds: float) -> bool:
+        if not self._is_martingale_maker_mode():
+            return False
+        blind_end = min(
+            float(getattr(self, "martingale_maker_blind_end_seconds", 15.0) or 15.0),
+            float(entry_end_seconds),
+        )
+        return float(elapsed) <= blind_end
 
     async def _try_maker_entry_probe(
         self,
@@ -1066,6 +1110,7 @@ class CopyTrader:
         usd_to_buy: float,
         min_entry_price: float,
         max_entry_price: float,
+        blind: bool = False,
     ) -> Dict:
         import datetime
 
@@ -1083,12 +1128,21 @@ class CopyTrader:
             "order_id": None,
             "remaining_usd": None,
             "partial": False,
+            "fallback_entry_price": None,
+            "blind": bool(blind),
             "route": "taker",
         }
         if not self._is_martingale_maker_mode():
             return result
 
-        maker_window_seconds = max(float(getattr(self, "martingale_maker_wait_seconds", 5.0)), 0.0)
+        maker_window_seconds = (
+            min(
+                float(getattr(self, "martingale_maker_blind_end_seconds", 15.0) or 15.0),
+                float(entry_end_seconds),
+            )
+            if blind
+            else max(float(getattr(self, "martingale_maker_wait_seconds", 5.0)), 0.0)
+        )
         if float(elapsed) > maker_window_seconds:
             return result
         wait_seconds = min(
@@ -1098,15 +1152,17 @@ class CopyTrader:
         if wait_seconds <= 0:
             return result
 
-        target_book = await self.fetch_order_book(target_token_id)
-        target_metrics = self._orderbook_metrics(target_book)
-        maker_price = self._maker_candidate_price(
-            target_metrics,
-            reference_price=entry_price,
-            min_price=min_entry_price,
-            max_price=max_entry_price,
-        )
-        result["attempted"] = True
+        if blind:
+            maker_price = self._blind_maker_price(min_entry_price, max_entry_price)
+        else:
+            target_book = await self.fetch_order_book(target_token_id)
+            target_metrics = self._orderbook_metrics(target_book)
+            maker_price = self._maker_candidate_price(
+                target_metrics,
+                reference_price=entry_price,
+                min_price=min_entry_price,
+                max_price=max_entry_price,
+            )
         result["maker_price"] = maker_price
         if maker_price is None:
             self.log(
@@ -1135,8 +1191,36 @@ class CopyTrader:
             float(usd_to_buy) / max(float(maker_price), 0.01),
             maker_price,
         )
+        min_limit_shares = float(getattr(self, "polymarket_min_limit_order_shares", 5.0) or 5.0)
+        if maker_shares < min_limit_shares:
+            self.log(
+                f"[MartingaleMaker] Skipping maker for {slug}: "
+                f"size={maker_shares:.2f} shares below min={min_limit_shares:.2f}. "
+                "Using taker directly."
+            )
+            self._record_maker_entry_event({
+                "event_ts_utc": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+                "slug": slug,
+                "dry_run": self.dry_run,
+                "direction": state.get("direction"),
+                "route": "taker_maker_min_size",
+                "elapsed_s": round(float(elapsed), 3),
+                "maker_price": maker_price,
+                "taker_reference_price": round(float(entry_price), 4),
+                "usd": round(float(usd_to_buy), 4),
+                "shares": maker_shares,
+                "maker_waited_seconds": 0.0,
+                "maker_touch_signal": False,
+                "hypothetical_taker_fee": self._martingale_fee_for_stake(usd_to_buy, entry_price),
+                "hypothetical_maker_fee": 0.0,
+            })
+            result["route"] = "taker_maker_min_size"
+            return result
+
+        result["attempted"] = True
+        maker_kind = "blind maker" if blind else "maker"
         self.log(
-            f"[MartingaleMaker] Maker {'probe' if self.dry_run else 'order'} | "
+            f"[MartingaleMaker] {maker_kind.capitalize()} {'probe' if self.dry_run else 'order'} | "
             f"slug={slug} | direction={state.get('direction')} | "
             f"maker_px={maker_price:.2f} | usd=${usd_to_buy:.2f} | wait={wait_seconds:.1f}s"
         )
@@ -1144,6 +1228,17 @@ class CopyTrader:
         sample_seconds = max(float(getattr(self, "martingale_maker_sample_seconds", 0.5)), 0.1)
         deadline = time.time() + wait_seconds
         touch_elapsed = None
+
+        async def maybe_find_taker_price() -> Optional[float]:
+            if not blind:
+                return None
+            try:
+                fresh_price = float(await self.fetch_buy_price(target_token_id))
+            except Exception:
+                return None
+            if fresh_price > 0 and self._entry_price_allowed(fresh_price, min_entry_price, max_entry_price):
+                return round(fresh_price, 4)
+            return None
 
         if self.dry_run:
             while True:
@@ -1157,6 +1252,14 @@ class CopyTrader:
                 if snapshot and snapshot.get("maker_touch_signal"):
                     result["maker_touch_signal"] = True
                     touch_elapsed = float(snapshot.get("elapsed_s") or 0.0)
+                    break
+                fallback_price = await maybe_find_taker_price()
+                if fallback_price is not None:
+                    result["fallback_entry_price"] = fallback_price
+                    self.log(
+                        f"[MartingaleMaker] Blind maker saw taker price {fallback_price:.4f}; "
+                        "using normal fallback."
+                    )
                     break
                 now = time.time()
                 if now >= deadline:
@@ -1180,7 +1283,10 @@ class CopyTrader:
                     f"Simulating maker fill with fee=$0.00."
                 )
             else:
-                self.log("[MartingaleMaker] Maker probe not filled in dry run; using taker fallback.")
+                if blind and result.get("fallback_entry_price") is None:
+                    self.log("[MartingaleMaker] Blind maker not filled and taker price is still unavailable.")
+                else:
+                    self.log("[MartingaleMaker] Maker probe not filled in dry run; using taker fallback.")
         else:
             if session is None:
                 self.log("[MartingaleMaker] No MCP session available for live maker order; using taker fallback.")
@@ -1231,6 +1337,14 @@ class CopyTrader:
                             )
                             if filled_shares > 0:
                                 result["maker_touch_signal"] = True
+                            fallback_price = await maybe_find_taker_price()
+                            if fallback_price is not None and filled_shares <= 0:
+                                result["fallback_entry_price"] = fallback_price
+                                self.log(
+                                    f"[MartingaleMaker] Blind maker saw taker price {fallback_price:.4f}; "
+                                    "cancelling maker and using normal fallback."
+                                )
+                                break
 
                         result["maker_waited_seconds"] = round(max(time.time() - (deadline - wait_seconds), 0.0), 3)
                         if filled_shares < maker_shares * 0.98:
@@ -1776,6 +1890,8 @@ class CopyTrader:
                     self.martingale_maker_price_offset = config.get('martingale_maker_price_offset', self.martingale_maker_price_offset)
                     self.martingale_maker_sample_seconds = config.get('martingale_maker_sample_seconds', self.martingale_maker_sample_seconds)
                     self.martingale_maker_record_seconds = config.get('martingale_maker_record_seconds', self.martingale_maker_record_seconds)
+                    self.martingale_maker_blind_price = config.get('martingale_maker_blind_price', self.martingale_maker_blind_price)
+                    self.martingale_maker_blind_end_seconds = config.get('martingale_maker_blind_end_seconds', self.martingale_maker_blind_end_seconds)
                     self.martingale_taker_fee_rate = max(float(self.martingale_taker_fee_rate), 0.0)
                     self.martingale_balance_floor_fraction = min(max(float(self.martingale_balance_floor_fraction), 0.0), 1.0)
                     self.martingale_order_type = str(self.martingale_order_type or "FOK").upper()
@@ -1793,6 +1909,8 @@ class CopyTrader:
                     self.martingale_maker_price_offset = min(max(float(self.martingale_maker_price_offset), 0.0), 0.10)
                     self.martingale_maker_sample_seconds = min(max(float(self.martingale_maker_sample_seconds), 0.1), 5.0)
                     self.martingale_maker_record_seconds = min(max(float(self.martingale_maker_record_seconds), 1.0), 120.0)
+                    self.martingale_maker_blind_price = min(max(float(self.martingale_maker_blind_price), 0.40), 0.60)
+                    self.martingale_maker_blind_end_seconds = min(max(float(self.martingale_maker_blind_end_seconds), 0.0), 30.0)
                     self.martingale_entry_end_seconds = 265
                     if self.martingale_min_entry_price < 0.40:
                         self.martingale_min_entry_price = 0.40
@@ -1872,7 +1990,9 @@ class CopyTrader:
                 "martingale_maker_wait_seconds": self.martingale_maker_wait_seconds,
                 "martingale_maker_price_offset": self.martingale_maker_price_offset,
                 "martingale_maker_sample_seconds": self.martingale_maker_sample_seconds,
-                "martingale_maker_record_seconds": self.martingale_maker_record_seconds
+                "martingale_maker_record_seconds": self.martingale_maker_record_seconds,
+                "martingale_maker_blind_price": self.martingale_maker_blind_price,
+                "martingale_maker_blind_end_seconds": self.martingale_maker_blind_end_seconds
             },
             "multipliers": self.app_state["multipliers"],
             "history": self.history,
@@ -1887,9 +2007,19 @@ class CopyTrader:
 
     def log(self, message: str):
         print(message)
+        self.log_total_count = int(getattr(self, "log_total_count", 0) or 0) + 1
         self.logs.append(message)
-        if len(self.logs) > 300:
-            self.logs.pop(0)
+        limit = int(getattr(self, "log_buffer_limit", 5000) or 5000)
+        if len(self.logs) > limit:
+            del self.logs[:len(self.logs) - limit]
+        try:
+            import datetime
+            os.makedirs(self.data_dir, exist_ok=True)
+            with open(self.runtime_log_file, "a", encoding="utf-8") as f:
+                ts = datetime.datetime.now(datetime.timezone.utc).isoformat()
+                f.write(f"{ts} {message}\n")
+        except Exception:
+            pass
 
     async def start(self, duration_minutes: int = None):
         if self.running:
@@ -1981,7 +2111,9 @@ class CopyTrader:
                         if self._last_heartbeat_ts is None or (now_ts - self._last_heartbeat_ts) >= 60:
                             self.log(
                                 f"[Heartbeat] running=True | strategy={self.strategy_mode} | "
-                                f"poll={self.poll_interval}s | logs={len(self.logs)}"
+                                f"poll={self.poll_interval}s | "
+                                f"log_events={getattr(self, 'log_total_count', len(self.logs))} | "
+                                f"log_buffer={len(self.logs)}/{getattr(self, 'log_buffer_limit', 5000)}"
                             )
                             self._last_heartbeat_ts = now_ts
                         tick_elapsed = time.time() - now_ts
@@ -2598,6 +2730,7 @@ class CopyTrader:
                 for label, value in zip(("Yes", "No"), price_results):
                     prices[label] = 0.0 if isinstance(value, Exception) else float(value)
 
+            blind_maker = False
             # Pick once per cycle/window; on loss streaks, keep the same direction.
             if not state["direction"]:
                 eligible_directions = [
@@ -2605,19 +2738,43 @@ class CopyTrader:
                     if price > 0 and self._entry_price_allowed(price, min_entry_price, max_entry_price)
                 ]
                 if not eligible_directions:
-                    if not state.get("skip_logged"):
+                    no_taker_prices = all(float(price or 0.0) <= 0 for price in prices.values())
+                    if no_taker_prices and self._can_try_blind_maker(elapsed, entry_end_seconds):
+                        state["direction"] = random.choice(["Yes", "No"])
+                        state["direction_tentative"] = True
+                        blind_maker = True
+                        if int(state.get("streak", 0)) == 0:
+                            state["loss_bank"] = 0.0
                         self.log(
-                            f"[Martingale] Skipping {slug}: entry prices outside "
-                            f"{min_entry_price:.2f}-{max_entry_price:.2f} "
-                            f"(Yes={prices.get('Yes', 0):.4f}, No={prices.get('No', 0):.4f}). Retrying until cutoff."
+                            f"[MartingaleMaker] No taker prices for {slug} "
+                            f"(Yes={prices.get('Yes', 0):.4f}, No={prices.get('No', 0):.4f}). "
+                            f"Trying blind maker at ${self._blind_maker_price(min_entry_price, max_entry_price):.2f}."
                         )
-                        state["skip_logged"] = True
-                        self.save_state()
-                    return
-                state["direction"] = random.choice(eligible_directions)
-                if int(state.get("streak", 0)) == 0:
-                    state["loss_bank"] = 0.0
+                    else:
+                        if not state.get("skip_logged"):
+                            self.log(
+                                f"[Martingale] Skipping {slug}: entry prices outside "
+                                f"{min_entry_price:.2f}-{max_entry_price:.2f} "
+                                f"(Yes={prices.get('Yes', 0):.4f}, No={prices.get('No', 0):.4f}). Retrying until cutoff."
+                            )
+                            state["skip_logged"] = True
+                            self.save_state()
+                        return
+                else:
+                    state["direction"] = random.choice(eligible_directions)
+                    state["direction_tentative"] = False
+                    if int(state.get("streak", 0)) == 0:
+                        state["loss_bank"] = 0.0
                 
+            if not state["direction"]:
+                return
+            self._ensure_maker_orderbook_recorder(
+                slug,
+                start_time.timestamp(),
+                clob_token_ids,
+                target_direction=state.get("direction"),
+            )
+
             # Polymarket tokens: UP/Yes is index 0, DOWN/No is index 1 depending on market
             # Typically for up/down markets, 0 is UP (Yes), 1 is DOWN (No). 
             # We assume UP is 0, DOWN is 1. If not, we still bet on the same token.
@@ -2627,8 +2784,16 @@ class CopyTrader:
             
             entry_price = prices.get(state["direction"], 0.0)
             if entry_price <= 0:
-                self.log(f"[Martingale] Skipping entry for {slug}: invalid entry price {entry_price}")
-                return
+                if self._can_try_blind_maker(elapsed, entry_end_seconds):
+                    blind_maker = True
+                    entry_price = self._blind_maker_price(min_entry_price, max_entry_price)
+                    self.log(
+                        f"[MartingaleMaker] {state['direction']} taker price unavailable for {slug}; "
+                        f"trying blind maker at ${entry_price:.2f}."
+                    )
+                else:
+                    self.log(f"[Martingale] Skipping entry for {slug}: invalid entry price {entry_price}")
+                    return
             if not self._entry_price_allowed(entry_price, min_entry_price, max_entry_price):
                 if not state.get("skip_logged"):
                     mode = "recovery" if recovery_mode else "new-cycle"
@@ -2687,7 +2852,63 @@ class CopyTrader:
                 usd_to_buy=usd_to_buy,
                 min_entry_price=min_entry_price,
                 max_entry_price=max_entry_price,
+                blind=blind_maker,
             )
+
+            if blind_maker and not maker_result.get("filled"):
+                fallback_entry_price = maker_result.get("fallback_entry_price")
+                if fallback_entry_price is None:
+                    try:
+                        fresh_price = float(await self.fetch_buy_price(target_token_id))
+                    except Exception:
+                        fresh_price = 0.0
+                    if fresh_price > 0 and self._entry_price_allowed(fresh_price, min_entry_price, max_entry_price):
+                        fallback_entry_price = round(fresh_price, 4)
+
+                if fallback_entry_price is None:
+                    self.log(
+                        f"[MartingaleMaker] Blind maker for {slug} did not fill and taker price "
+                        "is still unavailable. Retrying before cutoff."
+                    )
+                    if state.get("direction_tentative"):
+                        state["direction"] = None
+                        state["target_token_id"] = None
+                        state["direction_tentative"] = False
+                    state["entry_retry_after"] = now_ts + max(
+                        float(getattr(self, "martingale_maker_sample_seconds", 0.5) or 0.5),
+                        0.5,
+                    )
+                    self.save_state()
+                    return
+
+                entry_price = float(fallback_entry_price)
+                raw_usd_to_buy = self._martingale_stake_for_price(state, entry_price)
+                usd_to_buy = round(max(raw_usd_to_buy, self.polymarket_min_market_buy_usd), 2)
+                estimated_shares = round(usd_to_buy / max(entry_price, 0.01), 4)
+                estimated_fee = self._martingale_fee_for_stake(usd_to_buy, entry_price)
+                self.log(
+                    f"[MartingaleMaker] Blind maker fallback | slug={slug} | "
+                    f"taker_px={entry_price:.4f} | usd=${usd_to_buy:.2f} | "
+                    f"shares~={estimated_shares:.4f} | fee~=${estimated_fee:.2f}"
+                )
+
+                if not self.dry_run:
+                    guard_ok, balance, _, balance_floor, projected_if_loss = await self._martingale_balance_guard(
+                        session=session,
+                        state=state,
+                        stake_usd=usd_to_buy,
+                        entry_price=entry_price,
+                    )
+                    if not guard_ok:
+                        self._abandon_martingale_recovery(state, "balance guard blocked blind fallback stake")
+                        state["entry_retry_after"] = start_time.timestamp() + entry_end_seconds + 1
+                        self.save_state()
+                        return
+                    if balance is not None and balance_floor is not None and projected_if_loss is not None:
+                        self.log(
+                            f"[Martingale] Balance guard OK | balance=${balance:.2f} | "
+                            f"projected_if_loss=${projected_if_loss:.2f} | floor=${balance_floor:.2f}"
+                        )
 
             entry_fee_usd = None
             if maker_result.get("filled") and not maker_result.get("fallback"):
@@ -2699,6 +2920,7 @@ class CopyTrader:
                 state["maker_price"] = maker_result.get("maker_price")
                 state["maker_waited_seconds"] = maker_result.get("maker_waited_seconds", 0.0)
                 state["maker_touch_signal"] = bool(maker_result.get("maker_touch_signal", False))
+                state["direction_tentative"] = False
                 self.log(
                     f"[MartingaleMaker] ENTRY filled as maker | usd=${filled_usd:.2f} | "
                     f"px={avg_entry_price:.4f} | shares={filled_shares:.4f} | fee=${entry_fee_usd:.2f}"
@@ -2734,55 +2956,73 @@ class CopyTrader:
                     order_ok, order_error, order_data = self._parse_order_response(order_text, allow_live=False)
                     if not order_ok:
                         self.log(f"[Error] Martingale order rejected: {order_error[:220]}")
-                        state["entry_attempts"] = int(state.get("entry_attempts", 0) or 0) + 1
-                        delay = self._martingale_retry_delay(f"{order_error} {order_text}", state["entry_attempts"])
-                        state["entry_retry_after"] = now_ts + delay
-                        if self._is_permanent_order_error(f"{order_error} {order_text}"):
-                            state["entry_retry_after"] = start_time.timestamp() + entry_end_seconds + 1
-                            self.log(f"[Martingale] Permanent order format/min-size error. Skipping entry for {slug}.")
-                        state["opened_at"] = None
-                        self.save_state()
-                        return
-                    filled_usd, filled_shares, avg_entry_price = self._order_fill_from_response(
-                        order_data,
-                        fallback_usd=taker_usd_to_buy,
-                        fallback_price=entry_price,
-                    )
-                    fill_ratio = filled_usd / taker_usd_to_buy if taker_usd_to_buy > 0 else 1.0
-                    if fill_ratio < 0.98:
-                        self.log(
-                            f"[Warn] Martingale partial fill detected: filled ${filled_usd:.2f}/"
-                            f"${taker_usd_to_buy:.2f}. Recovery accounting will use actual fill."
-                        )
-                    self.log(f"[Martingale] Executed Buy: {order_text[:50]}...")
-                    taker_fee_usd = self._martingale_fee_for_fill(filled_shares, avg_entry_price)
-                    if maker_filled_usd > 0:
-                        combined_usd = round(maker_filled_usd + filled_usd, 4)
-                        combined_shares = round(maker_filled_shares + filled_shares, 4)
-                        avg_entry_price = (
-                            round(
-                                ((maker_filled_shares * maker_avg_price) + (filled_shares * avg_entry_price))
-                                / combined_shares,
-                                6,
+                        if maker_filled_usd > 0:
+                            self.log(
+                                "[MartingaleMaker] Taker fallback failed after maker partial fill. "
+                                "Tracking the maker fill as the open position."
                             )
-                            if combined_shares > 0
-                            else avg_entry_price
+                            filled_usd = maker_filled_usd
+                            filled_shares = maker_filled_shares
+                            avg_entry_price = maker_avg_price
+                            entry_fee_usd = 0.0
+                            state["entry_route"] = "maker_partial_unfilled_remainder"
+                            state["maker_price"] = maker_result.get("maker_price")
+                            state["maker_waited_seconds"] = maker_result.get("maker_waited_seconds", 0.0)
+                            state["maker_touch_signal"] = bool(maker_result.get("maker_touch_signal", False))
+                            state["direction_tentative"] = False
+                            order_ok = True
+                        else:
+                            state["entry_attempts"] = int(state.get("entry_attempts", 0) or 0) + 1
+                            delay = self._martingale_retry_delay(f"{order_error} {order_text}", state["entry_attempts"])
+                            state["entry_retry_after"] = now_ts + delay
+                            if self._is_permanent_order_error(f"{order_error} {order_text}"):
+                                state["entry_retry_after"] = start_time.timestamp() + entry_end_seconds + 1
+                                self.log(f"[Martingale] Permanent order format/min-size error. Skipping entry for {slug}.")
+                            state["opened_at"] = None
+                            self.save_state()
+                            return
+                    if order_ok and order_data:
+                        filled_usd, filled_shares, avg_entry_price = self._order_fill_from_response(
+                            order_data,
+                            fallback_usd=taker_usd_to_buy,
+                            fallback_price=entry_price,
                         )
-                        filled_usd = combined_usd
-                        filled_shares = combined_shares
-                        entry_fee_usd = taker_fee_usd
-                    else:
-                        entry_fee_usd = taker_fee_usd
-                    state["entry_route"] = (
-                        "maker_partial_taker_fallback"
-                        if maker_filled_usd > 0
-                        else "taker_fallback"
-                        if maker_result.get("attempted")
-                        else "taker"
-                    )
-                    state["maker_price"] = maker_result.get("maker_price")
-                    state["maker_waited_seconds"] = maker_result.get("maker_waited_seconds", 0.0)
-                    state["maker_touch_signal"] = bool(maker_result.get("maker_touch_signal", False))
+                        fill_ratio = filled_usd / taker_usd_to_buy if taker_usd_to_buy > 0 else 1.0
+                        if fill_ratio < 0.98:
+                            self.log(
+                                f"[Warn] Martingale partial fill detected: filled ${filled_usd:.2f}/"
+                                f"${taker_usd_to_buy:.2f}. Recovery accounting will use actual fill."
+                            )
+                        self.log(f"[Martingale] Executed Buy: {order_text[:50]}...")
+                        taker_fee_usd = self._martingale_fee_for_fill(filled_shares, avg_entry_price)
+                        if maker_filled_usd > 0:
+                            combined_usd = round(maker_filled_usd + filled_usd, 4)
+                            combined_shares = round(maker_filled_shares + filled_shares, 4)
+                            avg_entry_price = (
+                                round(
+                                    ((maker_filled_shares * maker_avg_price) + (filled_shares * avg_entry_price))
+                                    / combined_shares,
+                                    6,
+                                )
+                                if combined_shares > 0
+                                else avg_entry_price
+                            )
+                            filled_usd = combined_usd
+                            filled_shares = combined_shares
+                            entry_fee_usd = taker_fee_usd
+                        else:
+                            entry_fee_usd = taker_fee_usd
+                        state["entry_route"] = (
+                            "maker_partial_taker_fallback"
+                            if maker_filled_usd > 0
+                            else "taker_fallback"
+                            if maker_result.get("attempted")
+                            else "taker"
+                        )
+                        state["maker_price"] = maker_result.get("maker_price")
+                        state["maker_waited_seconds"] = maker_result.get("maker_waited_seconds", 0.0)
+                        state["maker_touch_signal"] = bool(maker_result.get("maker_touch_signal", False))
+                        state["direction_tentative"] = False
                 except Exception as e:
                       self.log(f"[Error] Martingale Execution failed: {e}")
                       state["entry_attempts"] = int(state.get("entry_attempts", 0) or 0) + 1
@@ -2800,6 +3040,7 @@ class CopyTrader:
                 state["maker_price"] = maker_result.get("maker_price")
                 state["maker_waited_seconds"] = maker_result.get("maker_waited_seconds", 0.0)
                 state["maker_touch_signal"] = bool(maker_result.get("maker_touch_signal", False))
+                state["direction_tentative"] = False
 
             if entry_fee_usd is None:
                 entry_fee_usd = (
@@ -3094,6 +3335,8 @@ class CopyTrader:
         martingale_maker_price_offset: float = None,
         martingale_maker_sample_seconds: float = None,
         martingale_maker_record_seconds: float = None,
+        martingale_maker_blind_price: float = None,
+        martingale_maker_blind_end_seconds: float = None,
     ):
         previous_dry_run = bool(self.dry_run)
         previous_strategy_mode = self.strategy_mode
@@ -3139,6 +3382,10 @@ class CopyTrader:
             self.martingale_maker_sample_seconds = min(max(float(martingale_maker_sample_seconds), 0.1), 5.0)
         if martingale_maker_record_seconds is not None:
             self.martingale_maker_record_seconds = min(max(float(martingale_maker_record_seconds), 1.0), 120.0)
+        if martingale_maker_blind_price is not None:
+            self.martingale_maker_blind_price = min(max(float(martingale_maker_blind_price), 0.40), 0.60)
+        if martingale_maker_blind_end_seconds is not None:
+            self.martingale_maker_blind_end_seconds = min(max(float(martingale_maker_blind_end_seconds), 0.0), 30.0)
             
         self.log(f"Config Updated: Strat={self.strategy_mode}, Targets={len(self.target_wallets)}, DryRun={self.dry_run}, Interval={self.poll_interval}, WinSize={self.winning_size_value} ({self.winning_size_mode}), Martingale={self.martingale_initial_amount}")
         
@@ -3170,7 +3417,9 @@ class CopyTrader:
             "martingale_maker_wait_seconds": self.martingale_maker_wait_seconds,
             "martingale_maker_price_offset": self.martingale_maker_price_offset,
             "martingale_maker_sample_seconds": self.martingale_maker_sample_seconds,
-            "martingale_maker_record_seconds": self.martingale_maker_record_seconds
+            "martingale_maker_record_seconds": self.martingale_maker_record_seconds,
+            "martingale_maker_blind_price": self.martingale_maker_blind_price,
+            "martingale_maker_blind_end_seconds": self.martingale_maker_blind_end_seconds
         }
         # Prepend to history (newest first)
         self.history.insert(0, entry)
