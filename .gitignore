@@ -10,3 +10,4 @@ __pycache__/
 *.log
 run*.log
 data/
+run_reports/

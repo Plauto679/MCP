@@ -8,3 +8,5 @@ websockets
 aiohttp
 pandas
 openpyxl
+requests
+curl_cffi

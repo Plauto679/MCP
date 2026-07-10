@@ -31,6 +31,42 @@
             color: #fbbf24;
         }
 
+        .metric-card {
+            background-color: #111827;
+            border: 1px solid #374151;
+            border-radius: 0.5rem;
+            padding: 0.75rem;
+        }
+
+        .metric-label {
+            color: #94a3b8;
+            font-size: 0.68rem;
+            letter-spacing: 0;
+            text-transform: uppercase;
+        }
+
+        .metric-value {
+            color: #f8fafc;
+            font-size: 1.15rem;
+            font-weight: 800;
+            line-height: 1.25;
+            margin-top: 0.2rem;
+        }
+
+        .metric-sub {
+            color: #94a3b8;
+            font-size: 0.72rem;
+            margin-top: 0.15rem;
+        }
+
+        .positive {
+            color: #22c55e;
+        }
+
+        .negative {
+            color: #ef4444;
+        }
+
         ::-webkit-scrollbar {
             width: 8px;
         }
@@ -47,8 +83,21 @@
 </head>
 
 <body class="bg-gray-900 text-white min-h-screen p-8">
-    <div class="max-w-screen-2xl mx-auto h-[calc(100vh-4rem)]">
-        <div class="flex h-full space-x-4">
+    <div class="max-w-screen-2xl mx-auto h-[calc(100vh-4rem)] flex flex-col">
+        <div class="flex items-center justify-between mb-4">
+            <div>
+                <h1 class="text-xl font-bold text-gray-100">Polymarket Bot</h1>
+                <div class="text-xs text-gray-500">Trading controls and performance monitoring</div>
+            </div>
+            <div class="bg-gray-800 border border-gray-700 rounded-lg p-1 flex gap-1">
+                <button id="view-tab-trading" onclick="setAppView('trading')"
+                    class="px-4 py-2 rounded-md text-sm font-bold bg-blue-600 text-white">Trading</button>
+                <button id="view-tab-dashboard" onclick="setAppView('dashboard')"
+                    class="px-4 py-2 rounded-md text-sm font-bold text-gray-400 hover:text-white hover:bg-gray-700">Dashboard</button>
+            </div>
+        </div>
+
+        <div id="view-trading" class="flex flex-1 min-h-0 space-x-4">
 
             <!-- COLUMN 1: History (20%) -->
             <div class="w-1/5 bg-gray-800 p-4 rounded-lg border border-gray-700 flex flex-col h-full">
@@ -79,6 +128,8 @@
                             class="py-1 px-3 rounded-md text-sm font-bold text-gray-400 hover:text-white hover:bg-gray-600 transition-all duration-200">Martingale</button>
                         <button id="btn-mode-martingale-maker" onclick="setStrategyMode('martingale_maker')"
                             class="py-1 px-3 rounded-md text-sm font-bold text-gray-400 hover:text-white hover:bg-gray-600 transition-all duration-200">Martingale Maker</button>
+                        <button id="btn-mode-fair-value" onclick="setStrategyMode('fair_value')"
+                            class="py-1 px-3 rounded-md text-sm font-bold text-gray-400 hover:text-white hover:bg-gray-600 transition-all duration-200">Fair Value</button>
                     </div>
                     <input type="hidden" id="strategy-mode" value="{{ strategy_mode }}">
                 </div>
@@ -265,6 +316,306 @@
                     </div>
                 </div>
 
+                <!-- === SECTION: FAIR VALUE STRATEGY === -->
+                <div id="section-fair-value" class="hidden">
+                    <div class="bg-gray-750 p-4 rounded border border-gray-600 mb-6">
+                        <div class="flex items-center justify-between mb-4 border-b border-gray-600 pb-2">
+                            <h3 class="text-sm font-medium text-gray-300">Fair Value Logic</h3>
+                            <div class="flex items-center">
+                                <label for="fair-value-prefer-maker" class="text-xs text-gray-400 mr-2">Maker</label>
+                                <input type="checkbox" id="fair-value-prefer-maker" {% if fair_value_prefer_maker
+                                    %}checked{% endif %}
+                                    class="h-4 w-4 text-fuchsia-600 border-gray-600 rounded bg-gray-700">
+                            </div>
+                        </div>
+
+                        <div class="space-y-3">
+                            <div class="grid grid-cols-2 gap-3">
+                                <div>
+                                    <label class="block text-xs text-gray-500 uppercase">Stake ($)</label>
+                                    <input type="number" step="0.01" id="fair-value-stake-usd"
+                                        value="{{ fair_value_stake_usd }}"
+                                        class="mt-1 block w-full bg-gray-700 border border-gray-600 rounded-md shadow-sm py-2 px-3 text-white">
+                                </div>
+                                <div>
+                                    <label class="block text-xs text-gray-500 uppercase">Sample (s)</label>
+                                    <input type="number" step="0.1" id="fair-value-sample-seconds"
+                                        value="{{ fair_value_sample_seconds }}"
+                                        class="mt-1 block w-full bg-gray-700 border border-gray-600 rounded-md shadow-sm py-2 px-3 text-white">
+                                </div>
+                            </div>
+                            <div class="grid grid-cols-2 gap-3">
+                                <div>
+                                    <label class="block text-xs text-gray-500 uppercase">Taker Edge</label>
+                                    <input type="number" step="0.001" id="fair-value-min-taker-edge"
+                                        value="{{ fair_value_min_taker_edge }}"
+                                        class="mt-1 block w-full bg-gray-700 border border-gray-600 rounded-md shadow-sm py-2 px-3 text-white">
+                                </div>
+                                <div>
+                                    <label class="block text-xs text-gray-500 uppercase">Maker Edge</label>
+                                    <input type="number" step="0.001" id="fair-value-min-maker-edge"
+                                        value="{{ fair_value_min_maker_edge }}"
+                                        class="mt-1 block w-full bg-gray-700 border border-gray-600 rounded-md shadow-sm py-2 px-3 text-white">
+                                </div>
+                            </div>
+                            <div>
+                                <label class="block text-xs text-gray-500 uppercase">Min EV / $</label>
+                                <input type="number" step="0.01" id="fair-value-min-ev-per-usd"
+                                    value="{{ fair_value_min_ev_per_usd }}"
+                                    class="mt-1 block w-full bg-gray-700 border border-gray-600 rounded-md shadow-sm py-2 px-3 text-white">
+                            </div>
+                            <div class="flex items-center pt-2 border-t border-gray-700">
+                                <input type="checkbox" id="fair-value-entry-model-enabled" {% if
+                                    fair_value_entry_model_enabled %}checked{% endif %}
+                                    class="h-4 w-4 text-cyan-600 border-gray-600 rounded bg-gray-700">
+                                <label for="fair-value-entry-model-enabled" class="ml-2 block text-sm text-gray-300">Entry Model Guard</label>
+                            </div>
+                            <div class="grid grid-cols-2 gap-3">
+                                <div>
+                                    <label class="block text-xs text-gray-500 uppercase">Core Model P</label>
+                                    <input type="number" step="0.01" id="fair-value-core-entry-model-min-win-prob"
+                                        value="{{ fair_value_core_entry_model_min_win_prob }}"
+                                        class="mt-1 block w-full bg-gray-700 border border-gray-600 rounded-md shadow-sm py-2 px-3 text-white">
+                                </div>
+                                <div>
+                                    <label class="block text-xs text-gray-500 uppercase">Momentum Model P</label>
+                                    <input type="number" step="0.01" id="fair-value-momentum-entry-model-min-win-prob"
+                                        value="{{ fair_value_momentum_entry_model_min_win_prob }}"
+                                        class="mt-1 block w-full bg-gray-700 border border-gray-600 rounded-md shadow-sm py-2 px-3 text-white">
+                                </div>
+                            </div>
+                            <div class="flex items-center pt-2">
+                                <input type="checkbox" id="fair-value-core-enabled" {% if
+                                    fair_value_core_enabled %}checked{% endif %}
+                                    class="h-4 w-4 text-cyan-600 border-gray-600 rounded bg-gray-700">
+                                <label for="fair-value-core-enabled" class="ml-2 block text-sm text-gray-300">Core Edge</label>
+                            </div>
+                            <div class="flex items-center pt-1">
+                                <input type="checkbox" id="fair-value-core-contrarian-only" {% if
+                                    fair_value_core_contrarian_only %}checked{% endif %}
+                                    class="h-4 w-4 text-cyan-600 border-gray-600 rounded bg-gray-700">
+                                <label for="fair-value-core-contrarian-only" class="ml-2 block text-sm text-gray-300">Core Only Giro</label>
+                            </div>
+                            <div class="grid grid-cols-2 gap-3">
+                                <div>
+                                    <label class="block text-xs text-gray-500 uppercase">Core Max</label>
+                                    <input type="number" step="1" id="fair-value-core-max-entries-per-window"
+                                        value="{{ fair_value_core_max_entries_per_window }}"
+                                        class="mt-1 block w-full bg-gray-700 border border-gray-600 rounded-md shadow-sm py-2 px-3 text-white">
+                                </div>
+                                <div>
+                                    <label class="block text-xs text-gray-500 uppercase">Core EV Step</label>
+                                    <input type="number" step="0.01" id="fair-value-min-ev-improvement-per-entry"
+                                        value="{{ fair_value_min_ev_improvement_per_entry }}"
+                                        class="mt-1 block w-full bg-gray-700 border border-gray-600 rounded-md shadow-sm py-2 px-3 text-white">
+                                </div>
+                            </div>
+                            <div class="grid grid-cols-2 gap-3">
+                                <div>
+                                    <label class="block text-xs text-gray-500 uppercase">Entry Start (s)</label>
+                                    <input type="number" step="1" id="fair-value-entry-start-seconds"
+                                        value="{{ fair_value_entry_start_seconds }}"
+                                        class="mt-1 block w-full bg-gray-700 border border-gray-600 rounded-md shadow-sm py-2 px-3 text-white">
+                                </div>
+                                <div>
+                                    <label class="block text-xs text-gray-500 uppercase">Entry End (s)</label>
+                                    <input type="number" step="1" id="fair-value-entry-end-seconds"
+                                        value="{{ fair_value_entry_end_seconds }}"
+                                        class="mt-1 block w-full bg-gray-700 border border-gray-600 rounded-md shadow-sm py-2 px-3 text-white">
+                                </div>
+                            </div>
+                            <div class="grid grid-cols-2 gap-3">
+                                <div>
+                                    <label class="block text-xs text-gray-500 uppercase">Min Price</label>
+                                    <input type="number" step="0.01" id="fair-value-min-price"
+                                        value="{{ fair_value_min_price }}"
+                                        class="mt-1 block w-full bg-gray-700 border border-gray-600 rounded-md shadow-sm py-2 px-3 text-white">
+                                </div>
+                                <div>
+                                    <label class="block text-xs text-gray-500 uppercase">Max Price</label>
+                                    <input type="number" step="0.01" id="fair-value-max-price"
+                                        value="{{ fair_value_max_price }}"
+                                        class="mt-1 block w-full bg-gray-700 border border-gray-600 rounded-md shadow-sm py-2 px-3 text-white">
+                                </div>
+                            </div>
+                            <div class="flex items-center pt-2 border-t border-gray-700">
+                                <input type="checkbox" id="fair-value-giro-probe-enabled" {% if
+                                    fair_value_giro_probe_enabled %}checked{% endif %}
+                                    class="h-4 w-4 text-cyan-600 border-gray-600 rounded bg-gray-700">
+                                <label for="fair-value-giro-probe-enabled" class="ml-2 block text-sm text-gray-300">Giro Probe</label>
+                            </div>
+                            <div class="grid grid-cols-2 gap-3">
+                                <div>
+                                    <label class="block text-xs text-gray-500 uppercase">Giro Start (s)</label>
+                                    <input type="number" step="1" id="fair-value-giro-probe-start-seconds"
+                                        value="{{ fair_value_giro_probe_start_seconds }}"
+                                        class="mt-1 block w-full bg-gray-700 border border-gray-600 rounded-md shadow-sm py-2 px-3 text-white">
+                                </div>
+                                <div>
+                                    <label class="block text-xs text-gray-500 uppercase">Giro End (s)</label>
+                                    <input type="number" step="1" id="fair-value-giro-probe-end-seconds"
+                                        value="{{ fair_value_giro_probe_end_seconds }}"
+                                        class="mt-1 block w-full bg-gray-700 border border-gray-600 rounded-md shadow-sm py-2 px-3 text-white">
+                                </div>
+                            </div>
+                            <div class="grid grid-cols-2 gap-3">
+                                <div>
+                                    <label class="block text-xs text-gray-500 uppercase">Giro Min Price</label>
+                                    <input type="number" step="0.01" id="fair-value-giro-probe-min-price"
+                                        value="{{ fair_value_giro_probe_min_price }}"
+                                        class="mt-1 block w-full bg-gray-700 border border-gray-600 rounded-md shadow-sm py-2 px-3 text-white">
+                                </div>
+                                <div>
+                                    <label class="block text-xs text-gray-500 uppercase">Giro Max Price</label>
+                                    <input type="number" step="0.01" id="fair-value-giro-probe-max-price"
+                                        value="{{ fair_value_giro_probe_max_price }}"
+                                        class="mt-1 block w-full bg-gray-700 border border-gray-600 rounded-md shadow-sm py-2 px-3 text-white">
+                                </div>
+                            </div>
+                            <div class="grid grid-cols-2 gap-3">
+                                <div>
+                                    <label class="block text-xs text-gray-500 uppercase">Giro Min Delta</label>
+                                    <input type="number" step="0.1" id="fair-value-giro-probe-min-abs-delta-bps"
+                                        value="{{ fair_value_giro_probe_min_abs_delta_bps }}"
+                                        class="mt-1 block w-full bg-gray-700 border border-gray-600 rounded-md shadow-sm py-2 px-3 text-white">
+                                </div>
+                                <div>
+                                    <label class="block text-xs text-gray-500 uppercase">Giro Min Prob</label>
+                                    <input type="number" step="0.01" id="fair-value-giro-probe-min-probability"
+                                        value="{{ fair_value_giro_probe_min_probability }}"
+                                        class="mt-1 block w-full bg-gray-700 border border-gray-600 rounded-md shadow-sm py-2 px-3 text-white">
+                                </div>
+                            </div>
+                            <div class="grid grid-cols-2 gap-3">
+                                <div>
+                                    <label class="block text-xs text-gray-500 uppercase">Giro Min EV</label>
+                                    <input type="number" step="0.01" id="fair-value-giro-probe-min-ev-per-usd"
+                                        value="{{ fair_value_giro_probe_min_ev_per_usd }}"
+                                        class="mt-1 block w-full bg-gray-700 border border-gray-600 rounded-md shadow-sm py-2 px-3 text-white">
+                                </div>
+                                <div>
+                                    <label class="block text-xs text-gray-500 uppercase">Giro Min Conf</label>
+                                    <input type="number" step="0.01" id="fair-value-giro-probe-min-confidence"
+                                        value="{{ fair_value_giro_probe_min_confidence }}"
+                                        class="mt-1 block w-full bg-gray-700 border border-gray-600 rounded-md shadow-sm py-2 px-3 text-white">
+                                </div>
+                            </div>
+                            <div class="grid grid-cols-2 gap-3">
+                                <div>
+                                    <label class="block text-xs text-gray-500 uppercase">Giro Max</label>
+                                    <input type="number" step="1" id="fair-value-giro-probe-max-entries-per-window"
+                                        value="{{ fair_value_giro_probe_max_entries_per_window }}"
+                                        class="mt-1 block w-full bg-gray-700 border border-gray-600 rounded-md shadow-sm py-2 px-3 text-white">
+                                </div>
+                            </div>
+                            <div class="grid grid-cols-2 gap-3">
+                                <div>
+                                    <label class="block text-xs text-gray-500 uppercase">Giro Price Step</label>
+                                    <input type="number" step="0.01" id="fair-value-giro-probe-min-price-step"
+                                        value="{{ fair_value_giro_probe_min_price_step }}"
+                                        class="mt-1 block w-full bg-gray-700 border border-gray-600 rounded-md shadow-sm py-2 px-3 text-white">
+                                </div>
+                                <div>
+                                    <label class="block text-xs text-gray-500 uppercase">Giro Stake x</label>
+                                    <input type="number" step="0.1" id="fair-value-giro-probe-stake-multiplier"
+                                        value="{{ fair_value_giro_probe_stake_multiplier }}"
+                                        class="mt-1 block w-full bg-gray-700 border border-gray-600 rounded-md shadow-sm py-2 px-3 text-white">
+                                </div>
+                            </div>
+                            <div class="grid grid-cols-2 gap-3">
+                                <div>
+                                    <label class="block text-xs text-gray-500 uppercase">Maker Wait (s)</label>
+                                    <input type="number" step="0.1" id="fair-value-maker-wait-seconds"
+                                        value="{{ fair_value_maker_wait_seconds }}"
+                                        class="mt-1 block w-full bg-gray-700 border border-gray-600 rounded-md shadow-sm py-2 px-3 text-white">
+                                </div>
+                                <div>
+                                    <label class="block text-xs text-gray-500 uppercase">Sensitivity</label>
+                                    <input type="number" step="1" id="fair-value-model-sensitivity-bps"
+                                        value="{{ fair_value_model_sensitivity_bps }}"
+                                        class="mt-1 block w-full bg-gray-700 border border-gray-600 rounded-md shadow-sm py-2 px-3 text-white">
+                                </div>
+                            </div>
+                            <div class="flex items-center pt-2 border-t border-gray-700">
+                                <input type="checkbox" id="fair-value-momentum-enabled" {% if
+                                    fair_value_momentum_enabled %}checked{% endif %}
+                                    class="h-4 w-4 text-cyan-600 border-gray-600 rounded bg-gray-700">
+                                <label for="fair-value-momentum-enabled" class="ml-2 block text-sm text-gray-300">Momentum</label>
+                            </div>
+                            <div class="grid grid-cols-2 gap-3">
+                                <div>
+                                    <label class="block text-xs text-gray-500 uppercase">Momentum Start (s)</label>
+                                    <input type="number" step="1" id="fair-value-momentum-start-seconds"
+                                        value="{{ fair_value_momentum_start_seconds }}"
+                                        class="mt-1 block w-full bg-gray-700 border border-gray-600 rounded-md shadow-sm py-2 px-3 text-white">
+                                </div>
+                                <div>
+                                    <label class="block text-xs text-gray-500 uppercase">Momentum End (s)</label>
+                                    <input type="number" step="1" id="fair-value-momentum-end-seconds"
+                                        value="{{ fair_value_momentum_end_seconds }}"
+                                        class="mt-1 block w-full bg-gray-700 border border-gray-600 rounded-md shadow-sm py-2 px-3 text-white">
+                                </div>
+                            </div>
+                            <div class="grid grid-cols-2 gap-3">
+                                <div>
+                                    <label class="block text-xs text-gray-500 uppercase">Momentum Edge</label>
+                                    <input type="number" step="0.001" id="fair-value-momentum-min-edge"
+                                        value="{{ fair_value_momentum_min_edge }}"
+                                        class="mt-1 block w-full bg-gray-700 border border-gray-600 rounded-md shadow-sm py-2 px-3 text-white">
+                                </div>
+                                <div>
+                                    <label class="block text-xs text-gray-500 uppercase">Momentum EV / $</label>
+                                    <input type="number" step="0.01" id="fair-value-momentum-min-ev-per-usd"
+                                        value="{{ fair_value_momentum_min_ev_per_usd }}"
+                                        class="mt-1 block w-full bg-gray-700 border border-gray-600 rounded-md shadow-sm py-2 px-3 text-white">
+                                </div>
+                            </div>
+                            <div class="grid grid-cols-2 gap-3">
+                                <div>
+                                    <label class="block text-xs text-gray-500 uppercase">Momentum Confidence</label>
+                                    <input type="number" step="0.01" id="fair-value-momentum-min-confidence"
+                                        value="{{ fair_value_momentum_min_confidence }}"
+                                        class="mt-1 block w-full bg-gray-700 border border-gray-600 rounded-md shadow-sm py-2 px-3 text-white">
+                                </div>
+                            </div>
+                            <div class="grid grid-cols-2 gap-3">
+                                <div>
+                                    <label class="block text-xs text-gray-500 uppercase">Momentum Max Price</label>
+                                    <input type="number" step="0.01" id="fair-value-momentum-max-price"
+                                        value="{{ fair_value_momentum_max_price }}"
+                                        class="mt-1 block w-full bg-gray-700 border border-gray-600 rounded-md shadow-sm py-2 px-3 text-white">
+                                </div>
+                                <div>
+                                    <label class="block text-xs text-gray-500 uppercase">Momentum Stake x</label>
+                                    <input type="number" step="0.1" id="fair-value-momentum-stake-multiplier"
+                                        value="{{ fair_value_momentum_stake_multiplier }}"
+                                        class="mt-1 block w-full bg-gray-700 border border-gray-600 rounded-md shadow-sm py-2 px-3 text-white">
+                                </div>
+                            </div>
+                            <div class="grid grid-cols-2 gap-3">
+                                <div>
+                                    <label class="block text-xs text-gray-500 uppercase">Momentum Max</label>
+                                    <input type="number" step="1" id="fair-value-momentum-max-entries-per-window"
+                                        value="{{ fair_value_momentum_max_entries_per_window }}"
+                                        class="mt-1 block w-full bg-gray-700 border border-gray-600 rounded-md shadow-sm py-2 px-3 text-white">
+                                </div>
+                                <div>
+                                    <label class="block text-xs text-gray-500 uppercase">Momentum EV Step</label>
+                                    <input type="number" step="0.01" id="fair-value-momentum-min-ev-improvement-per-entry"
+                                        value="{{ fair_value_momentum_min_ev_improvement_per_entry }}"
+                                        class="mt-1 block w-full bg-gray-700 border border-gray-600 rounded-md shadow-sm py-2 px-3 text-white">
+                                </div>
+                            </div>
+                            <div class="flex items-center pt-1">
+                                <input type="checkbox" id="fair-value-live-trading-enabled" {% if
+                                    fair_value_live_trading_enabled %}checked{% endif %}
+                                    class="h-4 w-4 text-red-600 border-gray-600 rounded bg-gray-700">
+                                <label for="fair-value-live-trading-enabled" class="ml-2 block text-sm text-gray-300">Allow Live Orders</label>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+
                 <!-- Common Settings -->
                 <div class="grid grid-cols-2 gap-4 mb-6">
                     <div>
@@ -312,7 +663,7 @@
             </div>
 
             <!-- COLUMN 3: Live Logs (50%) -->
-            <div class="w-1/2 bg-gray-900 rounded-lg border border-gray-700 flex flex-col h-full">
+            <div class="w-1/2 bg-gray-900 rounded-lg border border-gray-700 flex flex-col h-full min-w-0">
                 <div class="bg-gray-800 p-3 rounded-t-lg border-b border-gray-700 flex justify-between items-center gap-3">
                     <h2 class="font-mono font-bold text-gray-300">>_ Terminal Output</h2>
                     <div class="flex items-center gap-3 text-xs font-mono">
@@ -329,7 +680,134 @@
             </div>
 
         </div>
-    </div>
+
+        <div id="view-dashboard"
+            class="hidden flex-1 min-h-0 overflow-y-auto bg-gray-900 rounded-lg border border-gray-700">
+            <div class="bg-gray-800 px-5 py-4 border-b border-gray-700 flex justify-between items-center gap-3">
+                <div>
+                    <h2 class="text-xl font-bold text-gray-100">Performance Dashboard</h2>
+                    <div id="perf-updated" class="text-xs text-gray-500 mt-1">Waiting for metrics...</div>
+                </div>
+                <button onclick="loadPerformance()"
+                    class="text-sm text-blue-300 hover:text-blue-200 font-semibold">Refresh</button>
+            </div>
+
+            <div class="p-5 space-y-5">
+                <div class="grid grid-cols-4 gap-4">
+                    <div class="metric-card">
+                        <div class="metric-label">Portfolio</div>
+                        <div id="perf-balance" class="metric-value">--</div>
+                        <div id="perf-contrib" class="metric-sub">Contributions: --</div>
+                    </div>
+                    <div class="metric-card">
+                        <div class="metric-label">Trading Profit</div>
+                        <div id="perf-profit" class="metric-value">--</div>
+                        <div id="perf-profit-source" class="metric-sub">Ledger not configured</div>
+                    </div>
+                    <div class="metric-card">
+                        <div class="metric-label">Today PnL</div>
+                        <div id="perf-today-pnl" class="metric-value">--</div>
+                        <div id="perf-today-trades" class="metric-sub">0 trades today</div>
+                    </div>
+                    <div class="metric-card">
+                        <div class="metric-label">Active Cycle</div>
+                        <div id="perf-active" class="metric-value">--</div>
+                        <div id="perf-active-sub" class="metric-sub">--</div>
+                    </div>
+                </div>
+
+                <div class="grid grid-cols-4 gap-4">
+                    <div class="metric-card">
+                        <div class="metric-label">Wins / Losses</div>
+                        <div id="perf-wl" class="metric-value text-base">--</div>
+                    </div>
+                    <div class="metric-card">
+                        <div class="metric-label">Longest Loss Streak</div>
+                        <div id="perf-loss-streak" class="metric-value text-base">--</div>
+                    </div>
+                    <div class="metric-card">
+                        <div class="metric-label">Max Stake Today</div>
+                        <div id="perf-max-stake" class="metric-value text-base">--</div>
+                    </div>
+                    <div class="metric-card">
+                        <div class="metric-label">Fees Today</div>
+                        <div id="perf-fees" class="metric-value text-base">--</div>
+                    </div>
+                </div>
+
+                <div class="grid grid-cols-3 gap-4">
+                    <div class="metric-card">
+                        <div class="metric-label">Maker Fills</div>
+                        <div id="perf-maker" class="metric-value text-base">--</div>
+                    </div>
+                    <div class="metric-card">
+                        <div class="metric-label">Late Entries</div>
+                        <div id="perf-late" class="metric-value text-base">--</div>
+                    </div>
+                    <div class="metric-card">
+                        <div class="metric-label">Guardrail</div>
+                        <div id="perf-guardrail" class="metric-value text-base">--</div>
+                    </div>
+                </div>
+
+                <div class="bg-gray-950 border border-gray-700 rounded-lg p-4">
+                    <div class="flex items-center justify-between mb-3">
+                        <div>
+                            <h3 class="font-bold text-gray-200">Portfolio Timeline</h3>
+                            <div id="perf-chart-note" class="text-xs text-gray-500 mt-1">
+                                Portfolio value and net contributions
+                            </div>
+                        </div>
+                        <div class="flex flex-col items-end gap-2">
+                            <div class="flex items-center gap-4 text-xs text-gray-300">
+                                <span><span class="inline-block w-3 h-3 rounded-sm bg-cyan-200 mr-1"></span>Net contributions</span>
+                                <span><span class="inline-block w-3 h-3 rounded-sm bg-pink-500 mr-1"></span>Portfolio value</span>
+                            </div>
+                            <div class="flex items-center gap-2 text-xs">
+                                <button onclick="setPerformanceRange(1)"
+                                    class="perf-range-btn px-2 py-1 rounded bg-gray-800 text-gray-300 border border-gray-700">24h</button>
+                                <button onclick="setPerformanceRange(7)"
+                                    class="perf-range-btn px-2 py-1 rounded bg-gray-800 text-gray-300 border border-gray-700">7d</button>
+                                <button onclick="setPerformanceRange(30)"
+                                    class="perf-range-btn px-2 py-1 rounded bg-gray-800 text-gray-300 border border-gray-700">30d</button>
+                                <button onclick="setPerformanceRange(null)"
+                                    class="perf-range-btn px-2 py-1 rounded bg-gray-800 text-gray-300 border border-gray-700">All</button>
+                            </div>
+                            <div class="flex items-center gap-2 text-xs text-gray-400">
+                                <span id="perf-range-label" class="w-16 text-right">7 days</span>
+                                <input id="perf-range-slider" type="range" min="1" max="60" value="7"
+                                    oninput="setPerformanceRange(parseInt(this.value), true)"
+                                    class="w-40 accent-blue-500">
+                            </div>
+                        </div>
+                    </div>
+                    <canvas id="performance-chart" class="w-full h-[320px]"></canvas>
+                </div>
+
+                <div class="border border-gray-700 rounded-lg overflow-hidden">
+                    <div class="px-3 py-2 bg-gray-800 text-xs text-gray-400 font-semibold uppercase">
+                        Recent Trades
+                    </div>
+                    <div class="overflow-x-auto">
+                        <table class="w-full text-xs">
+                            <thead class="bg-gray-800 text-gray-500">
+                                <tr>
+                                    <th class="text-left p-2">Market</th>
+                                    <th class="text-left p-2">Side</th>
+                                    <th class="text-right p-2">Stake</th>
+                                    <th class="text-right p-2">Px</th>
+                                    <th class="text-right p-2">PnL</th>
+                                    <th class="text-left p-2">Route</th>
+                                </tr>
+                            </thead>
+                            <tbody id="perf-recent-trades" class="divide-y divide-gray-800">
+                                <tr><td colspan="6" class="p-3 text-center text-gray-500">No data yet</td></tr>
+                            </tbody>
+                        </table>
+                    </div>
+                </div>
+            </div>
+        </div>
     </div>
 
     <script>
@@ -343,8 +821,33 @@
         let autoFollowLogs = true;
         let isRunning = {{ 'true' if running else 'false' }};
         let historyData = [];
+        let currentAppView = 'trading';
+        let lastPerformanceData = null;
+        let performanceRangeDays = 7;
         // Parse python list of wallets to JS array
         let currentWallets = {{ target_wallets | tojson }};
+
+        function setAppView(view) {
+            currentAppView = view === 'dashboard' ? 'dashboard' : 'trading';
+            const tradingView = document.getElementById('view-trading');
+            const dashboardView = document.getElementById('view-dashboard');
+            const tradingTab = document.getElementById('view-tab-trading');
+            const dashboardTab = document.getElementById('view-tab-dashboard');
+            const selectedClass = "px-4 py-2 rounded-md text-sm font-bold bg-blue-600 text-white";
+            const unselectedClass = "px-4 py-2 rounded-md text-sm font-bold text-gray-400 hover:text-white hover:bg-gray-700";
+
+            tradingView.classList.toggle('hidden', currentAppView !== 'trading');
+            tradingView.classList.toggle('flex', currentAppView === 'trading');
+            dashboardView.classList.toggle('hidden', currentAppView !== 'dashboard');
+            dashboardView.classList.toggle('block', currentAppView === 'dashboard');
+            tradingTab.className = currentAppView === 'trading' ? selectedClass : unselectedClass;
+            dashboardTab.className = currentAppView === 'dashboard' ? selectedClass : unselectedClass;
+
+            if (currentAppView === 'dashboard') {
+                loadPerformance();
+                setTimeout(() => renderPerformanceChart(lastPerformanceData), 50);
+            }
+        }
 
         // Initialize UI
         function initWallets() {
@@ -397,6 +900,7 @@
             const btnWin = document.getElementById('btn-mode-winning');
             const btnMartingale = document.getElementById('btn-mode-martingale');
             const btnMartingaleMaker = document.getElementById('btn-mode-martingale-maker');
+            const btnFairValue = document.getElementById('btn-mode-fair-value');
 
             // Reset all to unselected
             const unselectedClass = "py-1 px-3 rounded-md text-sm font-bold text-gray-400 hover:text-white hover:bg-gray-600 transition-all duration-200";
@@ -404,11 +908,13 @@
             btnWin.className = unselectedClass;
             btnMartingale.className = unselectedClass;
             btnMartingaleMaker.className = unselectedClass;
+            btnFairValue.className = unselectedClass;
 
             document.getElementById('section-copy').classList.add('hidden');
             document.getElementById('section-winning').classList.add('hidden');
             document.getElementById('section-martingale').classList.add('hidden');
             document.getElementById('section-martingale-maker').classList.add('hidden');
+            document.getElementById('section-fair-value').classList.add('hidden');
 
             if (mode === 'winning') {
                 btnWin.className = "py-1 px-3 rounded-md text-sm font-bold bg-green-600 text-white shadow-sm transition-all duration-200";
@@ -419,6 +925,9 @@
             } else if (mode === 'martingale_maker') {
                 btnMartingaleMaker.className = "py-1 px-3 rounded-md text-sm font-bold bg-fuchsia-600 text-white shadow-sm transition-all duration-200";
                 document.getElementById('section-martingale-maker').classList.remove('hidden');
+            } else if (mode === 'fair_value') {
+                btnFairValue.className = "py-1 px-3 rounded-md text-sm font-bold bg-cyan-600 text-white shadow-sm transition-all duration-200";
+                document.getElementById('section-fair-value').classList.remove('hidden');
             } else { // default to copy
                 btnCopy.className = "py-1 px-3 rounded-md text-sm font-bold bg-blue-600 text-white shadow-sm transition-all duration-200";
                 document.getElementById('section-copy').classList.remove('hidden');
@@ -440,6 +949,8 @@
         updateSizeLabel(); // Set correct label on load
         updateWinningSizeLabel();
         loadHistory(); // Load history on start
+        loadPerformance();
+        setInterval(loadPerformance, 30000);
         initWallets();
 
         // Init Strategy Mode
@@ -547,6 +1058,329 @@
         refreshLogSnapshot();
         setInterval(refreshLogSnapshot, 1000);
 
+        function escapeHtml(value) {
+            return String(value ?? '')
+                .replaceAll('&', '&amp;')
+                .replaceAll('<', '&lt;')
+                .replaceAll('>', '&gt;')
+                .replaceAll('"', '&quot;')
+                .replaceAll("'", '&#039;');
+        }
+
+        function formatMoney(value, signed = false) {
+            if (value === null || value === undefined || Number.isNaN(Number(value))) return '--';
+            const number = Number(value);
+            const prefix = signed && number > 0 ? '+$' : number < 0 ? '-$' : '$';
+            return `${prefix}${Math.abs(number).toLocaleString(undefined, {
+                minimumFractionDigits: 2,
+                maximumFractionDigits: 2
+            })}`;
+        }
+
+        function formatNumber(value, digits = 2) {
+            if (value === null || value === undefined || Number.isNaN(Number(value))) return '--';
+            return Number(value).toLocaleString(undefined, {
+                minimumFractionDigits: digits,
+                maximumFractionDigits: digits
+            });
+        }
+
+        function setMetricText(id, value) {
+            const el = document.getElementById(id);
+            if (el) el.textContent = value;
+        }
+
+        function setMoneyMetric(id, value, signed = false) {
+            const el = document.getElementById(id);
+            if (!el) return;
+            el.textContent = formatMoney(value, signed);
+            el.classList.toggle('positive', Number(value) > 0);
+            el.classList.toggle('negative', Number(value) < 0);
+        }
+
+        async function loadPerformance() {
+            try {
+                const res = await fetch('/api/performance');
+                const data = await res.json();
+                renderPerformance(data);
+            } catch (error) {
+                setMetricText('perf-updated', 'Metrics unavailable');
+            }
+        }
+
+        function renderPerformance(data) {
+            lastPerformanceData = data;
+            const portfolio = data.portfolio || {};
+            const today = data.today || {};
+            const total = data.total || {};
+            const active = data.active || {};
+            const generatedAt = data.generated_at ? new Date(data.generated_at).toLocaleTimeString() : '--';
+
+            setMetricText('perf-updated', `Updated ${generatedAt}`);
+            setMoneyMetric('perf-balance', portfolio.last_reported_balance);
+            setMetricText('perf-contrib', portfolio.contributions_configured
+                ? `Contributions: ${formatMoney(portfolio.net_contributions)}`
+                : 'Contributions ledger missing');
+
+            if (portfolio.contributions_configured) {
+                setMoneyMetric('perf-profit', portfolio.trading_profit_from_balance, true);
+                setMetricText('perf-profit-source', 'Balance minus contributions');
+            } else {
+                setMoneyMetric('perf-profit', portfolio.closed_trading_pnl_total, true);
+                setMetricText('perf-profit-source', 'Closed PnL, ledger pending');
+            }
+
+            setMoneyMetric('perf-today-pnl', today.pnl, true);
+            setMetricText('perf-today-trades', `${today.trades || 0} trades today`);
+
+            if (active.entry_done) {
+                setMetricText('perf-active', `${active.direction || '--'} ${formatMoney(active.current_amount)}`);
+                if (active.strategy_mode === 'fair_value') {
+                    const fair = active.fair_probability === null || active.fair_probability === undefined
+                        ? '--'
+                        : `${formatNumber(Number(active.fair_probability) * 100, 1)}%`;
+                    const edge = active.edge_probability === null || active.edge_probability === undefined
+                        ? '--'
+                        : `${formatNumber(Number(active.edge_probability) * 100, 2)}pp`;
+                    const entries = active.open_entry_count ? `${active.open_entry_count} entries | ` : '';
+                    const tactic = active.tactic ? `${active.tactic} | ` : '';
+                    setMetricText('perf-active-sub', `${entries}${tactic}fair ${fair} | edge ${edge} | ${active.entry_route || 'route --'}`);
+                } else {
+                    setMetricText('perf-active-sub',
+                        `streak ${active.streak || 0} | loss bank ${formatMoney(active.loss_bank)} | ${active.entry_route || 'route --'}`);
+                }
+            } else {
+                setMetricText('perf-active', active.running ? 'Waiting' : 'Stopped');
+                setMetricText('perf-active-sub', `${active.strategy_mode || '--'} | ${active.dry_run ? 'dry run' : 'live'}`);
+            }
+
+            const winRate = today.win_rate === null || today.win_rate === undefined ? '--' : `${formatNumber(today.win_rate, 1)}%`;
+            setMetricText('perf-wl', `${today.wins || 0} / ${today.losses || 0} (${winRate})`);
+            setMetricText('perf-loss-streak', `${today.max_loss_streak || 0}`);
+            setMoneyMetric('perf-max-stake', today.max_stake);
+            setMoneyMetric('perf-fees', today.fees);
+            setMetricText('perf-maker', `${today.maker_trades || 0} (${formatMoney(today.maker_notional)})`);
+            setMetricText('perf-late', `${today.late_entries_15s || 0} >15s | ${today.late_entries_60s || 0} >60s`);
+
+            if (portfolio.last_reported_balance !== null && portfolio.guardrail_floor !== null) {
+                const distance = Number(portfolio.last_reported_balance) - Number(portfolio.guardrail_floor);
+                setMetricText('perf-guardrail', `${formatMoney(portfolio.guardrail_floor)} floor`);
+                const guardrail = document.getElementById('perf-guardrail');
+                if (guardrail) {
+                    guardrail.title = `Distance to floor: ${formatMoney(distance)}`;
+                }
+            } else {
+                setMetricText('perf-guardrail', '--');
+            }
+
+            renderRecentTrades(data.recent_trades || []);
+            renderPerformanceChart(data);
+        }
+
+        function renderRecentTrades(trades) {
+            const tbody = document.getElementById('perf-recent-trades');
+            if (!tbody) return;
+            if (!trades.length) {
+                tbody.innerHTML = '<tr><td colspan="6" class="p-3 text-center text-gray-500">No data yet</td></tr>';
+                return;
+            }
+            tbody.innerHTML = trades.slice().reverse().map((trade) => {
+                const pnl = Number(trade.pnl || 0);
+                const pnlClass = pnl > 0 ? 'positive' : pnl < 0 ? 'negative' : 'text-gray-300';
+                const resultClass = String(trade.result).toUpperCase() === 'WIN' ? 'positive' : 'negative';
+                return `
+                    <tr class="text-gray-300">
+                        <td class="p-2 whitespace-nowrap">${escapeHtml((trade.market_local || '').replace(' CEST', ''))}</td>
+                        <td class="p-2">
+                            <span class="${resultClass} font-semibold">${escapeHtml(trade.direction)}</span>
+                            <span class="text-gray-500">s${escapeHtml(trade.streak)}</span>
+                        </td>
+                        <td class="p-2 text-right">${formatMoney(trade.stake)}</td>
+                        <td class="p-2 text-right">${formatNumber(trade.entry_price, 2)}</td>
+                        <td class="p-2 text-right ${pnlClass}">${formatMoney(trade.pnl, true)}</td>
+                        <td class="p-2">${escapeHtml(trade.route || 'unknown')}</td>
+                    </tr>
+                `;
+            }).join('');
+        }
+
+        function renderPerformanceChart(data) {
+            const canvas = document.getElementById('performance-chart');
+            const note = document.getElementById('perf-chart-note');
+            if (!canvas || !data || currentAppView !== 'dashboard') return;
+
+            updatePerformanceRangeControls();
+
+            let portfolioPoints = ((data.chart || {}).portfolio || [])
+                .map(p => ({ x: new Date(p.ts).getTime(), y: Number(p.value) }))
+                .filter(p => Number.isFinite(p.x) && Number.isFinite(p.y));
+            let contributionPoints = ((data.chart || {}).contributions || [])
+                .map(p => ({ x: new Date(p.ts).getTime(), y: Number(p.value) }))
+                .filter(p => Number.isFinite(p.x) && Number.isFinite(p.y));
+
+            if (performanceRangeDays !== null && portfolioPoints.length) {
+                const latestX = Math.max(...portfolioPoints.map(p => p.x));
+                const cutoff = latestX - (performanceRangeDays * 24 * 60 * 60 * 1000);
+                portfolioPoints = portfolioPoints.filter(p => p.x >= cutoff);
+                contributionPoints = contributionPoints.filter(p => p.x >= cutoff);
+            }
+
+            if (note) {
+                note.textContent = contributionPoints.length
+                    ? 'Portfolio value vs configured net contributions'
+                    : 'Portfolio value shown. Add data/capital_ledger.csv to draw net contributions.';
+            }
+
+            const dpr = window.devicePixelRatio || 1;
+            const rect = canvas.getBoundingClientRect();
+            const width = Math.max(320, Math.floor(rect.width));
+            const height = Math.max(260, Math.floor(rect.height || 320));
+            canvas.width = Math.floor(width * dpr);
+            canvas.height = Math.floor(height * dpr);
+            const ctx = canvas.getContext('2d');
+            ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+            ctx.clearRect(0, 0, width, height);
+
+            if (!portfolioPoints.length) {
+                ctx.fillStyle = '#94a3b8';
+                ctx.font = '14px sans-serif';
+                ctx.fillText('No portfolio data yet', 24, 36);
+                return;
+            }
+
+            const allPoints = contributionPoints.length
+                ? portfolioPoints.concat(contributionPoints)
+                : portfolioPoints;
+            const minX = Math.min(...allPoints.map(p => p.x));
+            const maxX = Math.max(...allPoints.map(p => p.x));
+            const rawMinY = Math.min(...allPoints.map(p => p.y));
+            const rawMaxY = Math.max(...allPoints.map(p => p.y));
+            const yPad = Math.max(10, (rawMaxY - rawMinY) * 0.12);
+            const minY = Math.max(0, rawMinY - yPad);
+            const maxY = rawMaxY + yPad;
+            const pad = { left: 58, right: 18, top: 18, bottom: 40 };
+            const chartW = width - pad.left - pad.right;
+            const chartH = height - pad.top - pad.bottom;
+            const xRange = Math.max(1, maxX - minX);
+            const yRange = Math.max(1, maxY - minY);
+            const sx = (x) => pad.left + ((x - minX) / xRange) * chartW;
+            const sy = (y) => pad.top + chartH - ((y - minY) / yRange) * chartH;
+
+            ctx.fillStyle = '#0f172a';
+            ctx.fillRect(0, 0, width, height);
+
+            ctx.strokeStyle = '#1f2937';
+            ctx.lineWidth = 1;
+            ctx.fillStyle = '#94a3b8';
+            ctx.font = '12px sans-serif';
+            ctx.textAlign = 'right';
+            ctx.textBaseline = 'middle';
+            for (let i = 0; i <= 4; i++) {
+                const y = minY + (yRange * i / 4);
+                const py = sy(y);
+                ctx.beginPath();
+                ctx.moveTo(pad.left, py);
+                ctx.lineTo(width - pad.right, py);
+                ctx.stroke();
+                ctx.fillText(formatCompactMoney(y), pad.left - 10, py);
+            }
+
+            ctx.textAlign = 'center';
+            ctx.textBaseline = 'top';
+            for (let i = 0; i <= 4; i++) {
+                const x = minX + (xRange * i / 4);
+                const px = sx(x);
+                ctx.fillText(formatChartDate(x), px, height - pad.bottom + 16);
+            }
+
+            if (contributionPoints.length) {
+                drawAreaLine(ctx, contributionPoints, sx, sy, height - pad.bottom, '#a5f3fc', 'rgba(165, 243, 252, 0.18)', 2);
+            }
+            drawAreaLine(ctx, portfolioPoints, sx, sy, null, '#ec4899', null, 2.5);
+        }
+
+        function setPerformanceRange(days, fromSlider = false) {
+            performanceRangeDays = days === null ? null : Math.max(1, Math.min(60, Number(days) || 7));
+            if (!fromSlider && performanceRangeDays !== null) {
+                const slider = document.getElementById('perf-range-slider');
+                if (slider) slider.value = performanceRangeDays;
+            }
+            renderPerformanceChart(lastPerformanceData);
+        }
+
+        function updatePerformanceRangeControls() {
+            const label = document.getElementById('perf-range-label');
+            const slider = document.getElementById('perf-range-slider');
+            if (label) {
+                label.textContent = performanceRangeDays === null
+                    ? 'All'
+                    : `${performanceRangeDays} day${performanceRangeDays === 1 ? '' : 's'}`;
+            }
+            if (slider) {
+                slider.disabled = performanceRangeDays === null;
+                slider.classList.toggle('opacity-40', performanceRangeDays === null);
+            }
+            document.querySelectorAll('.perf-range-btn').forEach((button) => {
+                const active =
+                    (button.textContent === '24h' && performanceRangeDays === 1) ||
+                    (button.textContent === '7d' && performanceRangeDays === 7) ||
+                    (button.textContent === '30d' && performanceRangeDays === 30) ||
+                    (button.textContent === 'All' && performanceRangeDays === null);
+                button.className = active
+                    ? 'perf-range-btn px-2 py-1 rounded bg-blue-600 text-white border border-blue-400'
+                    : 'perf-range-btn px-2 py-1 rounded bg-gray-800 text-gray-300 border border-gray-700';
+            });
+        }
+
+        function drawAreaLine(ctx, points, sx, sy, baseline, stroke, fill, width = 2) {
+            if (!points.length) return;
+            ctx.beginPath();
+            points.forEach((point, index) => {
+                const x = sx(point.x);
+                const y = sy(point.y);
+                if (index === 0) ctx.moveTo(x, y);
+                else ctx.lineTo(x, y);
+            });
+            if (fill && baseline !== null) {
+                const last = points[points.length - 1];
+                const first = points[0];
+                ctx.lineTo(sx(last.x), baseline);
+                ctx.lineTo(sx(first.x), baseline);
+                ctx.closePath();
+                ctx.fillStyle = fill;
+                ctx.fill();
+                ctx.beginPath();
+                points.forEach((point, index) => {
+                    const x = sx(point.x);
+                    const y = sy(point.y);
+                    if (index === 0) ctx.moveTo(x, y);
+                    else ctx.lineTo(x, y);
+                });
+            }
+            ctx.strokeStyle = stroke;
+            ctx.lineWidth = width;
+            ctx.lineJoin = 'round';
+            ctx.lineCap = 'round';
+            ctx.stroke();
+        }
+
+        function formatCompactMoney(value) {
+            const abs = Math.abs(Number(value) || 0);
+            if (abs >= 1000) return `$${(value / 1000).toFixed(1)}k`;
+            return `$${Math.round(value)}`;
+        }
+
+        function formatChartDate(ms) {
+            const date = new Date(ms);
+            return date.toLocaleDateString(undefined, { month: 'short', day: 'numeric' });
+        }
+
+        window.addEventListener('resize', () => {
+            if (currentAppView === 'dashboard') {
+                renderPerformanceChart(lastPerformanceData);
+            }
+        });
+
         async function saveConfig() {
             // Collect all wallet inputs
             const walletInputs = document.querySelectorAll('.wallet-input');
@@ -575,7 +1409,49 @@
                 martingale_maker_sample_seconds: parseFloat(document.getElementById('martingale-maker-sample-seconds').value),
                 martingale_maker_record_seconds: parseFloat(document.getElementById('martingale-maker-record-seconds').value),
                 martingale_maker_blind_price: parseFloat(document.getElementById('martingale-maker-blind-price').value),
-                martingale_maker_blind_end_seconds: parseFloat(document.getElementById('martingale-maker-blind-end-seconds').value)
+                martingale_maker_blind_end_seconds: parseFloat(document.getElementById('martingale-maker-blind-end-seconds').value),
+                fair_value_stake_usd: parseFloat(document.getElementById('fair-value-stake-usd').value),
+                fair_value_min_taker_edge: parseFloat(document.getElementById('fair-value-min-taker-edge').value),
+                fair_value_min_maker_edge: parseFloat(document.getElementById('fair-value-min-maker-edge').value),
+                fair_value_min_ev_per_usd: parseFloat(document.getElementById('fair-value-min-ev-per-usd').value),
+                fair_value_entry_start_seconds: parseFloat(document.getElementById('fair-value-entry-start-seconds').value),
+                fair_value_entry_end_seconds: parseFloat(document.getElementById('fair-value-entry-end-seconds').value),
+                fair_value_min_price: parseFloat(document.getElementById('fair-value-min-price').value),
+                fair_value_max_price: parseFloat(document.getElementById('fair-value-max-price').value),
+                fair_value_giro_probe_enabled: document.getElementById('fair-value-giro-probe-enabled').checked,
+                fair_value_giro_probe_start_seconds: parseFloat(document.getElementById('fair-value-giro-probe-start-seconds').value),
+                fair_value_giro_probe_end_seconds: parseFloat(document.getElementById('fair-value-giro-probe-end-seconds').value),
+                fair_value_giro_probe_min_price: parseFloat(document.getElementById('fair-value-giro-probe-min-price').value),
+                fair_value_giro_probe_max_price: parseFloat(document.getElementById('fair-value-giro-probe-max-price').value),
+                fair_value_giro_probe_min_abs_delta_bps: parseFloat(document.getElementById('fair-value-giro-probe-min-abs-delta-bps').value),
+                fair_value_giro_probe_min_probability: parseFloat(document.getElementById('fair-value-giro-probe-min-probability').value),
+                fair_value_giro_probe_min_ev_per_usd: parseFloat(document.getElementById('fair-value-giro-probe-min-ev-per-usd').value),
+                fair_value_giro_probe_min_confidence: parseFloat(document.getElementById('fair-value-giro-probe-min-confidence').value),
+                fair_value_giro_probe_max_entries_per_window: parseInt(document.getElementById('fair-value-giro-probe-max-entries-per-window').value),
+                fair_value_giro_probe_min_price_step: parseFloat(document.getElementById('fair-value-giro-probe-min-price-step').value),
+                fair_value_giro_probe_stake_multiplier: parseFloat(document.getElementById('fair-value-giro-probe-stake-multiplier').value),
+                fair_value_maker_wait_seconds: parseFloat(document.getElementById('fair-value-maker-wait-seconds').value),
+                fair_value_sample_seconds: parseFloat(document.getElementById('fair-value-sample-seconds').value),
+                fair_value_model_sensitivity_bps: parseFloat(document.getElementById('fair-value-model-sensitivity-bps').value),
+                fair_value_prefer_maker: document.getElementById('fair-value-prefer-maker').checked,
+                fair_value_live_trading_enabled: document.getElementById('fair-value-live-trading-enabled').checked,
+                fair_value_core_enabled: document.getElementById('fair-value-core-enabled').checked,
+                fair_value_core_contrarian_only: document.getElementById('fair-value-core-contrarian-only').checked,
+                fair_value_core_max_entries_per_window: parseInt(document.getElementById('fair-value-core-max-entries-per-window').value),
+                fair_value_min_ev_improvement_per_entry: parseFloat(document.getElementById('fair-value-min-ev-improvement-per-entry').value),
+                fair_value_momentum_enabled: document.getElementById('fair-value-momentum-enabled').checked,
+                fair_value_momentum_start_seconds: parseFloat(document.getElementById('fair-value-momentum-start-seconds').value),
+                fair_value_momentum_end_seconds: parseFloat(document.getElementById('fair-value-momentum-end-seconds').value),
+                fair_value_momentum_min_edge: parseFloat(document.getElementById('fair-value-momentum-min-edge').value),
+                fair_value_momentum_min_ev_per_usd: parseFloat(document.getElementById('fair-value-momentum-min-ev-per-usd').value),
+                fair_value_momentum_min_confidence: parseFloat(document.getElementById('fair-value-momentum-min-confidence').value),
+                fair_value_momentum_max_price: parseFloat(document.getElementById('fair-value-momentum-max-price').value),
+                fair_value_momentum_stake_multiplier: parseFloat(document.getElementById('fair-value-momentum-stake-multiplier').value),
+                fair_value_momentum_max_entries_per_window: parseInt(document.getElementById('fair-value-momentum-max-entries-per-window').value),
+                fair_value_momentum_min_ev_improvement_per_entry: parseFloat(document.getElementById('fair-value-momentum-min-ev-improvement-per-entry').value),
+                fair_value_entry_model_enabled: document.getElementById('fair-value-entry-model-enabled').checked,
+                fair_value_core_entry_model_min_win_prob: parseFloat(document.getElementById('fair-value-core-entry-model-min-win-prob').value),
+                fair_value_momentum_entry_model_min_win_prob: parseFloat(document.getElementById('fair-value-momentum-entry-model-min-win-prob').value)
             };
 
             try {
@@ -652,6 +1528,9 @@
                 } else if (item.strategy_mode === 'martingale_maker') {
                     modeLabel = 'M-MAKER';
                     modeColor = 'text-fuchsia-400';
+                } else if (item.strategy_mode === 'fair_value') {
+                    modeLabel = 'FAIR';
+                    modeColor = 'text-cyan-300';
                 }
 
                 // Truncate wallet for display (show first wallet count) or Strategy info
@@ -662,6 +1541,8 @@
                     subTitle = `Initial: $${item.martingale_initial_amount}`;
                 } else if (item.strategy_mode === 'martingale_maker') {
                     subTitle = `Init $${item.martingale_initial_amount} | M ${item.martingale_maker_wait_seconds || 5}s | B ${item.martingale_maker_blind_end_seconds || 15}s`;
+                } else if (item.strategy_mode === 'fair_value') {
+                    subTitle = `Stake $${item.fair_value_stake_usd || 1} | E ${item.fair_value_min_taker_edge || 0.10}`;
                 } else {
                     const walletCount = item.target_wallets ? item.target_wallets.length : (item.target_wallet ? 1 : 0);
                     subTitle = walletCount > 1 ? `${walletCount} Wallets` : (item.target_wallets?.[0] || item.target_wallet || "Unknown").substring(0, 6) + '...';
@@ -728,6 +1609,49 @@
                 document.getElementById('martingale-maker-record-seconds').value = item.martingale_maker_record_seconds || 15.0;
                 document.getElementById('martingale-maker-blind-price').value = item.martingale_maker_blind_price || 0.5;
                 document.getElementById('martingale-maker-blind-end-seconds').value = item.martingale_maker_blind_end_seconds || 15.0;
+            } else if (mode === 'fair_value') {
+                document.getElementById('fair-value-stake-usd').value = item.fair_value_stake_usd || 1.0;
+                document.getElementById('fair-value-min-taker-edge').value = item.fair_value_min_taker_edge || 0.10;
+                document.getElementById('fair-value-min-maker-edge').value = item.fair_value_min_maker_edge || 0.10;
+                document.getElementById('fair-value-min-ev-per-usd').value = item.fair_value_min_ev_per_usd || 0.30;
+                document.getElementById('fair-value-entry-start-seconds').value = item.fair_value_entry_start_seconds || 0.0;
+                document.getElementById('fair-value-entry-end-seconds').value = item.fair_value_entry_end_seconds || 240.0;
+                document.getElementById('fair-value-min-price').value = item.fair_value_min_price || 0.35;
+                document.getElementById('fair-value-max-price').value = item.fair_value_max_price || 0.50;
+                document.getElementById('fair-value-giro-probe-enabled').checked = item.fair_value_giro_probe_enabled !== false;
+                document.getElementById('fair-value-giro-probe-start-seconds').value = item.fair_value_giro_probe_start_seconds ?? 0.0;
+                document.getElementById('fair-value-giro-probe-end-seconds').value = item.fair_value_giro_probe_end_seconds || 300.0;
+                document.getElementById('fair-value-giro-probe-min-price').value = item.fair_value_giro_probe_min_price || 0.15;
+                document.getElementById('fair-value-giro-probe-max-price').value = item.fair_value_giro_probe_max_price || 0.42;
+                document.getElementById('fair-value-giro-probe-min-abs-delta-bps').value = item.fair_value_giro_probe_min_abs_delta_bps || 0.5;
+                document.getElementById('fair-value-giro-probe-min-probability').value = item.fair_value_giro_probe_min_probability || 0.40;
+                document.getElementById('fair-value-giro-probe-min-ev-per-usd').value = item.fair_value_giro_probe_min_ev_per_usd || 0.05;
+                document.getElementById('fair-value-giro-probe-min-confidence').value = item.fair_value_giro_probe_min_confidence || 0.10;
+                document.getElementById('fair-value-giro-probe-max-entries-per-window').value = item.fair_value_giro_probe_max_entries_per_window || 2;
+                document.getElementById('fair-value-giro-probe-min-price-step').value = item.fair_value_giro_probe_min_price_step || 0.03;
+                document.getElementById('fair-value-giro-probe-stake-multiplier').value = item.fair_value_giro_probe_stake_multiplier || 1.0;
+                document.getElementById('fair-value-maker-wait-seconds').value = item.fair_value_maker_wait_seconds || 3.0;
+                document.getElementById('fair-value-sample-seconds').value = item.fair_value_sample_seconds || 1.0;
+                document.getElementById('fair-value-model-sensitivity-bps').value = item.fair_value_model_sensitivity_bps || 28.0;
+                document.getElementById('fair-value-prefer-maker').checked = item.fair_value_prefer_maker !== false;
+                document.getElementById('fair-value-live-trading-enabled').checked = item.fair_value_live_trading_enabled === true;
+                document.getElementById('fair-value-core-enabled').checked = item.fair_value_core_enabled !== false;
+                document.getElementById('fair-value-core-contrarian-only').checked = item.fair_value_core_contrarian_only === true;
+                document.getElementById('fair-value-core-max-entries-per-window').value = item.fair_value_core_max_entries_per_window || 2;
+                document.getElementById('fair-value-min-ev-improvement-per-entry').value = item.fair_value_min_ev_improvement_per_entry || 0.03;
+                document.getElementById('fair-value-entry-model-enabled').checked = item.fair_value_entry_model_enabled !== false;
+                document.getElementById('fair-value-core-entry-model-min-win-prob').value = item.fair_value_core_entry_model_min_win_prob || 0.46;
+                document.getElementById('fair-value-momentum-entry-model-min-win-prob').value = item.fair_value_momentum_entry_model_min_win_prob || 0.63;
+                document.getElementById('fair-value-momentum-enabled').checked = item.fair_value_momentum_enabled !== false;
+                document.getElementById('fair-value-momentum-start-seconds').value = item.fair_value_momentum_start_seconds || 240.0;
+                document.getElementById('fair-value-momentum-end-seconds').value = item.fair_value_momentum_end_seconds || 300.0;
+                document.getElementById('fair-value-momentum-min-edge').value = item.fair_value_momentum_min_edge || 0.02;
+                document.getElementById('fair-value-momentum-min-ev-per-usd').value = item.fair_value_momentum_min_ev_per_usd || 0.05;
+                document.getElementById('fair-value-momentum-min-confidence').value = item.fair_value_momentum_min_confidence || 0.55;
+                document.getElementById('fair-value-momentum-max-price').value = item.fair_value_momentum_max_price || 0.90;
+                document.getElementById('fair-value-momentum-stake-multiplier').value = item.fair_value_momentum_stake_multiplier || 1.0;
+                document.getElementById('fair-value-momentum-max-entries-per-window').value = item.fair_value_momentum_max_entries_per_window || 2;
+                document.getElementById('fair-value-momentum-min-ev-improvement-per-entry').value = item.fair_value_momentum_min_ev_improvement_per_entry || 0.04;
             }
 
             // Optional: Auto-save on restore? Or let user click save? 

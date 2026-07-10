@@ -3,7 +3,11 @@ import os
 import sys
 import math
 import json
+import csv
 import time
+import datetime
+import threading
+from dataclasses import replace
 from typing import List, Dict, Optional, Tuple
 from zoneinfo import ZoneInfo
 from dotenv import load_dotenv
@@ -11,6 +15,18 @@ from dotenv import load_dotenv
 # We need to run the server as a subprocess for MCP connection
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
+from .fair_value import (
+    FairValueDecision,
+    best_decision,
+    blend_fair_yes_with_market,
+    estimate_fair_yes,
+    taker_breakeven_probability,
+    taker_fee_for_stake,
+    taker_ev_per_usd,
+)
+from .cheap_reversal_model import load_cheap_reversal_model, score_cheap_reversal_candidate
+from .fair_value_entry_model import load_entry_model, score_entry_candidate
+from .kalman_features import kalman_step
 
 load_dotenv()
 
@@ -64,6 +80,7 @@ class CopyTrader:
         self._http_session = None
         self._http_session_loop = None
         self._martingale_market_cache = {}
+        self._polymarket_http_backoff = {}
         self._martingale_prefetch_attempts = {}
         self._martingale_entry_plans = {}
         self._martingale_maker_recorder_tasks = {}
@@ -72,10 +89,14 @@ class CopyTrader:
         self._chainlink_feed_task: Optional[asyncio.Task] = None
         self._chainlink_connected = False
         self._last_chainlink_warn_ts: Optional[float] = None
+        self._binance_kline_cache = {}
+        self._last_supervisor_review_ts: Optional[float] = None
+        self._last_supervisor_disabled_log_ts: Optional[float] = None
         self._background_tasks = set()
+        self._csv_lock = threading.Lock()
         self.http_headers = {
             "Accept": "application/json",
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/126 Safari/537.36",
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/131 Safari/537.36",
         }
         self.martingale_decision_threshold = 0.5
         self.martingale_entry_start_seconds = 0
@@ -106,9 +127,98 @@ class CopyTrader:
         self.martingale_maker_record_seconds = 15.0
         self.martingale_maker_blind_price = 0.50
         self.martingale_maker_blind_end_seconds = 15.0
+        self.fair_value_stake_usd = 1.0
+        self.fair_value_min_taker_edge = 0.10
+        self.fair_value_min_maker_edge = 0.10
+        self.fair_value_min_ev_per_usd = 0.30
+        self.fair_value_taker_guard_min_edge = 0.06
+        self.fair_value_taker_guard_min_ev_per_usd = 0.12
+        self.fair_value_entry_start_seconds = 0.0
+        self.fair_value_entry_end_seconds = 240.0
+        self.fair_value_min_price = 0.35
+        self.fair_value_max_price = 0.50
+        self.fair_value_core_min_price = 0.35
+        self.fair_value_core_max_price = 0.50
+        self.fair_value_maker_wait_seconds = 3.0
+        self.fair_value_sample_seconds = 1.0
+        self.fair_value_model_sensitivity_bps = 28.0
+        self.fair_value_prefer_maker = True
+        self.fair_value_live_trading_enabled = False
+        self.fair_value_order_type = "FOK"
+        self.fair_value_core_enabled = True
+        self.fair_value_core_contrarian_only = False
+        self.fair_value_core_max_entries_per_window = 2
+        self.fair_value_min_ev_improvement_per_entry = 0.03
+        self.fair_value_momentum_enabled = True
+        self.fair_value_momentum_start_seconds = 240.0
+        self.fair_value_momentum_end_seconds = 300.0
+        self.fair_value_momentum_min_edge = 0.02
+        self.fair_value_momentum_min_ev_per_usd = 0.07
+        self.fair_value_momentum_min_confidence = 0.08
+        self.fair_value_momentum_max_price = 0.90
+        self.fair_value_momentum_stake_multiplier = 1.0
+        self.fair_value_momentum_max_entries_per_window = 2
+        self.fair_value_momentum_min_ev_improvement_per_entry = 0.04
+        self.fair_value_late_continuation_enabled = True
+        self.fair_value_late_continuation_start_seconds = 250.0
+        self.fair_value_late_continuation_end_seconds = 300.0
+        self.fair_value_late_continuation_min_abs_delta_bps = 5.0
+        self.fair_value_late_continuation_min_probability = 0.87
+        self.fair_value_late_continuation_max_probability = 0.95
+        self.fair_value_late_continuation_min_ev_per_usd = 0.015
+        self.fair_value_late_continuation_price_buffer = 0.01
+        self.fair_value_late_continuation_max_price = 0.95
+        self.fair_value_late_continuation_stake_multiplier = 1.0
+        self.fair_value_late_continuation_max_entries_per_window = 2
+        self.fair_value_late_continuation_min_ev_improvement_per_entry = 0.03
+        self.fair_value_late_continuation_entry_model_min_win_prob = 0.0
+        self.fair_value_giro_probe_enabled = True
+        self.fair_value_giro_probe_start_seconds = 0.0
+        self.fair_value_giro_probe_end_seconds = 300.0
+        self.fair_value_giro_probe_min_price = 0.15
+        self.fair_value_giro_probe_max_price = 0.42
+        self.fair_value_giro_probe_min_abs_delta_bps = 0.5
+        self.fair_value_giro_probe_min_probability = 0.45
+        self.fair_value_giro_probe_min_ev_per_usd = 0.05
+        self.fair_value_giro_probe_min_confidence = 0.10
+        self.fair_value_giro_probe_max_entries_per_window = 2
+        self.fair_value_giro_probe_min_price_step = 0.03
+        self.fair_value_giro_probe_stake_multiplier = 1.0
+        self.fair_value_giro_probe_model_enabled = True
+        self.fair_value_giro_probe_model_path = ""
+        self._cheap_reversal_model = None
+        self._cheap_reversal_model_loaded_path = None
+        self._cheap_reversal_model_loaded_mtime = None
+        self._last_cheap_reversal_model_warn_ts = 0.0
+        self.fair_value_entry_model_enabled = True
+        self.fair_value_core_entry_model_min_win_prob = 0.46
+        self.fair_value_core_entry_model_max_win_prob = 0.54
+        self.fair_value_momentum_entry_model_min_win_prob = 0.63
+        self.fair_value_shadow_dynamic_stake_enabled = True
+        self.fair_value_shadow_dynamic_stake_min_multiplier = 1.0
+        self.fair_value_shadow_dynamic_stake_max_multiplier = 2.0
+        self.fair_value_entry_model_path = ""
+        self._fair_value_entry_model = None
+        self._fair_value_entry_model_loaded_path = None
+        self._fair_value_entry_model_loaded_mtime = None
+        self._last_fair_value_entry_model_warn_ts = 0.0
+        self.fair_value_supervisor_enabled = True
+        self.fair_value_supervisor_interval_seconds = 2 * 60 * 60
+        self.fair_value_supervisor_lookback_seconds = 2 * 60 * 60
+        self.fair_value_entry_model_auto_retrain_enabled = True
+        self.fair_value_entry_model_auto_retrain_interval_seconds = 2 * 60 * 60
+        self.fair_value_entry_model_auto_retrain_min_holdout_rows = 80
+        self._last_entry_model_retrain_ts = time.time()
+        self._entry_model_retrain_running = False
         self.polymarket_min_market_buy_usd = 1.0
         self.polymarket_min_limit_order_shares = 5.0
         self.data_dir = os.path.join(os.path.dirname(__file__), "..", "data")
+        self.fair_value_entry_model_path = os.path.join(self.data_dir, "fair_value_entry_model.json")
+        self.fair_value_giro_probe_model_path = os.path.join(
+            self.data_dir,
+            "cheap_reversal",
+            "cheap_reversal_model.json",
+        )
         self.runtime_log_file = os.path.join(self.data_dir, "runtime.log")
         self._task: Optional[asyncio.Task] = None
         
@@ -144,6 +254,136 @@ class CopyTrader:
 
     def _is_martingale_maker_mode(self) -> bool:
         return self.strategy_mode == "martingale_maker"
+
+    def _is_fair_value_mode(self) -> bool:
+        return self.strategy_mode == "fair_value"
+
+    def _new_fair_value_state(self) -> Dict:
+        return {
+            "active_slug": None,
+            "entry_done": False,
+            "entries": [],
+            "next_entry_id": 1,
+            "direction": None,
+            "target_token_id": None,
+            "entry_price": 0.0,
+            "entry_shares": 0.0,
+            "stake_usd": 0.0,
+            "entry_fee_usd": 0.0,
+            "entry_route": "",
+            "fair_probability": 0.0,
+            "edge_probability": 0.0,
+            "ev_per_usd": 0.0,
+            "opened_at": None,
+            "maker_candidate": None,
+            "maker_attempted_slug": None,
+            "order_error_cooldown_until": 0.0,
+            "consecutive_order_errors": 0,
+            "last_signal_sample_at": 0.0,
+            "last_settlement_attempt_at": 0.0,
+            "skip_logged_slug": None,
+            "kalman": None,
+            "dry_run": bool(self.dry_run),
+        }
+
+    def _new_fair_value_giro_probe_state(self) -> Dict:
+        return {
+            "windows": {},
+            "next_entry_id": 1,
+            "settlement_attempts": {},
+            "dry_run": bool(self.dry_run),
+            "last_disabled_log_at": 0.0,
+        }
+
+    def _fair_value_entries(self, state: Dict) -> List[Dict]:
+        entries = state.get("entries")
+        if not isinstance(entries, list):
+            entries = []
+
+        if not entries and state.get("entry_done") and state.get("direction") in ("Yes", "No"):
+            entries = [{
+                "entry_id": int(state.get("next_entry_id", 1) or 1),
+                "entry_number_in_window": 1,
+                "tactic": state.get("tactic", "core_edge") or "core_edge",
+                "slug": state.get("active_slug"),
+                "direction": state.get("direction"),
+                "target_token_id": state.get("target_token_id"),
+                "entry_price": float(state.get("entry_price", 0.0) or 0.0),
+                "entry_shares": float(state.get("entry_shares", 0.0) or 0.0),
+                "stake_usd": float(state.get("stake_usd", 0.0) or 0.0),
+                "entry_fee_usd": float(state.get("entry_fee_usd", 0.0) or 0.0),
+                "entry_route": state.get("entry_route", ""),
+                "fair_probability": float(state.get("fair_probability", 0.0) or 0.0),
+                "edge_probability": float(state.get("edge_probability", 0.0) or 0.0),
+                "ev_per_usd": float(state.get("ev_per_usd", 0.0) or 0.0),
+                "break_even_price": float(state.get("break_even_price", 0.0) or 0.0),
+                "max_acceptable_price": float(state.get("max_acceptable_price", 0.0) or 0.0),
+                "price_margin": float(state.get("price_margin", 0.0) or 0.0),
+                "continuation_probability": float(state.get("continuation_probability", 0.0) or 0.0),
+                "abs_delta_bps": float(state.get("abs_delta_bps", 0.0) or 0.0),
+                "opened_at": state.get("opened_at"),
+                "elapsed_s": float(state.get("elapsed_s", 0.0) or 0.0),
+            }]
+            state["next_entry_id"] = 2
+
+        state["entries"] = entries
+        state["entry_done"] = bool(entries)
+        return entries
+
+    def _normalize_fair_value_state(self, state: Dict) -> Dict:
+        if not isinstance(state, dict):
+            return self._new_fair_value_state()
+        saved_dry_run = state.get("dry_run")
+        if saved_dry_run is not None and bool(saved_dry_run) != bool(self.dry_run):
+            self.log(
+                "[FairValue] DryRun mode changed since saved state. "
+                "Resetting paper/live state before continuing."
+            )
+            return self._new_fair_value_state()
+        defaults = self._new_fair_value_state()
+        for key, value in defaults.items():
+            state.setdefault(key, value)
+        state["dry_run"] = bool(self.dry_run)
+        self._fair_value_entries(state)
+        return state
+
+    def _normalize_fair_value_giro_probe_state(self, state: Dict) -> Dict:
+        if not isinstance(state, dict):
+            return self._new_fair_value_giro_probe_state()
+        saved_dry_run = state.get("dry_run")
+        if saved_dry_run is not None and bool(saved_dry_run) != bool(self.dry_run):
+            self.log(
+                "[GiroProbe] DryRun mode changed since saved state. "
+                "Resetting giro probe paper state."
+            )
+            return self._new_fair_value_giro_probe_state()
+        defaults = self._new_fair_value_giro_probe_state()
+        for key, value in defaults.items():
+            state.setdefault(key, value)
+        if not isinstance(state.get("windows"), dict):
+            state["windows"] = {}
+        if not isinstance(state.get("settlement_attempts"), dict):
+            state["settlement_attempts"] = {}
+        state["dry_run"] = bool(self.dry_run)
+        return state
+
+    def _reset_fair_value_for_mode_change(self, previous_dry_run: bool, new_dry_run: bool):
+        self.app_state["fair_value_state"] = self._new_fair_value_state()
+        self.app_state["fair_value_giro_probe_state"] = self._new_fair_value_giro_probe_state()
+        self.log(
+            f"[FairValue] DryRun changed {previous_dry_run} -> {new_dry_run}. "
+            "Resetting state so simulated entries never carry into live trading."
+        )
+
+    def _reset_fair_value_for_strategy_change(self, previous_strategy: str, new_strategy: str):
+        if previous_strategy == new_strategy or new_strategy != "fair_value":
+            return
+        self.app_state["fair_value_state"] = self._new_fair_value_state()
+        self.app_state["fair_value_giro_probe_state"] = self._new_fair_value_giro_probe_state()
+        self.log(
+            f"[FairValue] Strategy changed {previous_strategy} -> {new_strategy}. "
+            "Starting with a clean Fair Value state."
+        )
 
     def _new_martingale_state(self) -> Dict:
         return {
@@ -244,6 +484,122 @@ class CopyTrader:
             await self._http_session.close()
         self._http_session = None
         self._http_session_loop = None
+
+    def _polymarket_host_from_url(self, url: str) -> str:
+        try:
+            from urllib.parse import urlparse
+
+            return urlparse(url).netloc or "polymarket"
+        except Exception:
+            return "polymarket"
+
+    def _polymarket_backoff_active(self, url: str) -> bool:
+        host = self._polymarket_host_from_url(url)
+        item = self._polymarket_http_backoff.get(host, {})
+        return time.time() < float(item.get("next_ts", 0.0) or 0.0)
+
+    def _mark_polymarket_http_success(self, url: str):
+        self._polymarket_http_backoff.pop(self._polymarket_host_from_url(url), None)
+
+    def _mark_polymarket_http_failure(self, url: str, exc: Exception):
+        host = self._polymarket_host_from_url(url)
+        now_ts = time.time()
+        item = self._polymarket_http_backoff.get(host, {})
+        failures = int(item.get("failures", 0) or 0) + 1
+        delay = min(60.0, max(2.0, 2 ** min(failures, 5)))
+        item.update({"failures": failures, "next_ts": now_ts + delay})
+        self._polymarket_http_backoff[host] = item
+
+        last_warn = float(item.get("last_warn_ts", 0.0) or 0.0)
+        if now_ts - last_warn >= 60.0:
+            item["last_warn_ts"] = now_ts
+            self.log(
+                f"[Warn] Polymarket HTTP unavailable for {host}: "
+                f"{type(exc).__name__}: {str(exc)[:120]}. Backing off {delay:.0f}s."
+            )
+
+    def _sync_polymarket_get_json_via_curl(self, url: str, timeout: float = 8.0):
+        from curl_cffi import requests as curl_requests
+
+        response = curl_requests.get(
+            url,
+            timeout=timeout,
+            impersonate="chrome131",
+            http_version="v3",
+            headers=self.http_headers,
+        )
+        response.raise_for_status()
+        return response.json()
+
+    async def _polymarket_get_json_fallback(self, url: str, timeout: float = 8.0):
+        if self._polymarket_backoff_active(url):
+            return None
+        try:
+            data = await asyncio.to_thread(self._sync_polymarket_get_json_via_curl, url, timeout)
+            self._mark_polymarket_http_success(url)
+            return data
+        except Exception as exc:
+            self._mark_polymarket_http_failure(url, exc)
+            return None
+
+    def _sync_binance_btc_5m_kline(self, window_start_ts: float, timeout: float = 6.0):
+        import requests
+
+        start_ms = int(float(window_start_ts) * 1000)
+        url = (
+            "https://api.binance.com/api/v3/klines"
+            f"?symbol=BTCUSDT&interval=5m&startTime={start_ms}&limit=1"
+        )
+        response = requests.get(url, timeout=timeout)
+        response.raise_for_status()
+        data = response.json()
+        if not isinstance(data, list) or not data:
+            return None
+        item = data[0]
+        return {
+            "open_time": int(item[0]),
+            "open": float(item[1]),
+            "close": float(item[4]),
+            "close_time": int(item[6]),
+        }
+
+    async def _binance_btc_5m_context(self, window_start_ts: float, max_age_seconds: float = 1.0):
+        cache_key = int(float(window_start_ts))
+        now_ts = time.time()
+        cached = self._binance_kline_cache.get(cache_key)
+        if cached and now_ts - float(cached.get("fetched_at", 0.0) or 0.0) <= max(float(max_age_seconds), 0.0):
+            return cached.get("data")
+        try:
+            data = await asyncio.to_thread(self._sync_binance_btc_5m_kline, window_start_ts)
+            self._binance_kline_cache[cache_key] = {"fetched_at": now_ts, "data": data}
+            stale_keys = [key for key in self._binance_kline_cache if key < cache_key - 3600]
+            for key in stale_keys:
+                self._binance_kline_cache.pop(key, None)
+            return data
+        except Exception as exc:
+            now_ts = time.time()
+            last_warn = float(getattr(self, "_last_binance_warn_ts", 0.0) or 0.0)
+            if now_ts - last_warn >= 60.0:
+                self._last_binance_warn_ts = now_ts
+                self.log(f"[Warn] Binance BTC fallback unavailable: {type(exc).__name__}: {str(exc)[:120]}")
+            return None
+
+    async def _fair_value_price_context(self, window_start_ts: float, now_ts: float):
+        opening_price, _, _, _ = self._chainlink_boundary_sample(window_start_ts, tolerance_seconds=2.0)
+        latest_price, _, latest_offset = self._fair_value_latest_price_after(window_start_ts)
+        if opening_price and latest_price:
+            return opening_price, latest_price, latest_offset, "chainlink"
+
+        kline = await self._binance_btc_5m_context(window_start_ts)
+        if kline and kline.get("open") and kline.get("close"):
+            return (
+                float(kline["open"]),
+                float(kline["close"]),
+                round(max(float(now_ts) - float(window_start_ts), 0.0), 3),
+                "binance_5m_signal_fallback",
+            )
+
+        return opening_price, latest_price, latest_offset, "chainlink_unavailable"
 
     def _record_chainlink_price(self, timestamp_ms, value):
         try:
@@ -932,12 +1288,44 @@ class CopyTrader:
 
         os.makedirs(self.data_dir, exist_ok=True)
         path = os.path.join(self.data_dir, filename)
-        file_exists = os.path.exists(path)
-        with open(path, "a", newline="", encoding="utf-8") as f:
-            writer = csv.DictWriter(f, fieldnames=list(row.keys()))
+        lock = getattr(self, "_csv_lock", None)
+        if lock is None:
+            self._csv_lock = threading.Lock()
+            lock = self._csv_lock
+
+        with lock:
+            file_exists = os.path.exists(path) and os.path.getsize(path) > 0
+            row_fields = list(row.keys())
             if not file_exists:
+                with open(path, "w", newline="", encoding="utf-8") as f:
+                    writer = csv.DictWriter(f, fieldnames=row_fields)
+                    writer.writeheader()
+                    writer.writerow(row)
+                return
+
+            with open(path, "r", newline="", encoding="utf-8") as f:
+                reader = csv.DictReader(f)
+                existing_fields = list(reader.fieldnames or [])
+                missing_fields = [field for field in row_fields if field not in existing_fields]
+                if not missing_fields:
+                    fieldnames = existing_fields
+                    existing_rows = None
+                else:
+                    fieldnames = existing_fields + missing_fields
+                    existing_rows = list(reader)
+
+            if existing_rows is None:
+                with open(path, "a", newline="", encoding="utf-8") as f:
+                    writer = csv.DictWriter(f, fieldnames=fieldnames, extrasaction="ignore")
+                    writer.writerow(row)
+                return
+
+            with open(path, "w", newline="", encoding="utf-8") as f:
+                writer = csv.DictWriter(f, fieldnames=fieldnames, extrasaction="ignore")
                 writer.writeheader()
-            writer.writerow(row)
+                for existing_row in existing_rows:
+                    writer.writerow(existing_row)
+                writer.writerow(row)
 
     def _schedule_csv_row(self, filename: str, row: Dict):
         async def write_record():
@@ -949,6 +1337,322 @@ class CopyTrader:
         task = asyncio.create_task(write_record())
         self._background_tasks.add(task)
         task.add_done_callback(self._background_tasks.discard)
+
+    def _safe_float(self, value, default: float = 0.0) -> float:
+        try:
+            number = float(value)
+        except (TypeError, ValueError):
+            return default
+        return number if math.isfinite(number) else default
+
+    def _parse_iso_timestamp(self, value: str) -> Optional[float]:
+        text = str(value or "").strip()
+        if not text:
+            return None
+        try:
+            return datetime.datetime.fromisoformat(text.replace("Z", "+00:00")).timestamp()
+        except ValueError:
+            return None
+
+    def _read_csv_rows(self, filename: str) -> List[Dict]:
+        path = os.path.join(self.data_dir, filename)
+        if not os.path.exists(path):
+            return []
+        try:
+            with self._csv_lock:
+                with open(path, "r", newline="", encoding="utf-8") as f:
+                    return list(csv.DictReader(f))
+        except Exception:
+            return []
+
+    def _fair_value_supervisor_allowed(self) -> Tuple[bool, str]:
+        if not bool(getattr(self, "fair_value_supervisor_enabled", True)):
+            return False, "disabled"
+        if not self._is_fair_value_mode():
+            return False, "not_fair_value"
+        if not bool(self.dry_run):
+            return False, "live_dry_run_false"
+        if bool(getattr(self, "fair_value_live_trading_enabled", False)):
+            return False, "live_orders_enabled"
+        return True, "dry_run_recommendation_only"
+
+    def _build_fair_value_supervisor_review(self, now_ts: float) -> Dict:
+        lookback = max(float(getattr(self, "fair_value_supervisor_lookback_seconds", 7200.0)), 300.0)
+        cutoff_ts = float(now_ts) - lookback
+        entries = [
+            row for row in self._read_csv_rows("fair_value_entries.csv")
+            if (self._parse_iso_timestamp(row.get("event_ts_utc")) or 0.0) >= cutoff_ts
+        ]
+        outcomes = self._read_csv_rows("fair_value_outcomes.csv")
+        outcome_by_key = {}
+        for row in outcomes:
+            key = f"{row.get('slug', '')}|{row.get('entry_id', '')}"
+            if row.get("slug") and row.get("entry_id"):
+                outcome_by_key[key] = row
+
+        closed = []
+        open_entries = []
+        wins = 0
+        losses = 0
+        pnl = 0.0
+        core_entries = 0
+        core_pnl = 0.0
+        momentum_entries = 0
+        momentum_pnl = 0.0
+        maker_entries = 0
+        taker_entries = 0
+        ev_sum = 0.0
+        edge_sum = 0.0
+        ev_count = 0
+        max_stake = 0.0
+
+        for entry in entries:
+            key = f"{entry.get('slug', '')}|{entry.get('entry_id', '')}"
+            outcome = outcome_by_key.get(key)
+            tactic = entry.get("tactic") or "core_edge"
+            route = entry.get("route") or ""
+            stake = self._safe_float(entry.get("stake_usd"))
+            max_stake = max(max_stake, stake)
+            ev = self._safe_float(entry.get("ev_per_usd"), default=float("nan"))
+            edge = self._safe_float(entry.get("edge_probability"), default=float("nan"))
+            if math.isfinite(ev):
+                ev_sum += ev
+                ev_count += 1
+            if math.isfinite(edge):
+                edge_sum += edge
+            if tactic == "momentum":
+                momentum_entries += 1
+            else:
+                core_entries += 1
+            if "maker" in route.lower():
+                maker_entries += 1
+            if "taker" in route.lower():
+                taker_entries += 1
+
+            result = str((outcome or {}).get("result") or "").upper()
+            if result in ("WIN", "LOSS"):
+                closed.append(entry)
+                row_pnl = self._safe_float((outcome or {}).get("pnl_usd"))
+                pnl += row_pnl
+                if tactic == "momentum":
+                    momentum_pnl += row_pnl
+                else:
+                    core_pnl += row_pnl
+                if result == "WIN":
+                    wins += 1
+                else:
+                    losses += 1
+            else:
+                open_entries.append(entry)
+
+        signals = [
+            row for row in self._read_csv_rows("fair_value_signals.csv")
+            if (self._parse_iso_timestamp(row.get("sample_ts_utc")) or 0.0) >= cutoff_ts
+        ]
+        candidate_signals = [
+            row for row in signals
+            if str(row.get("decision_reason") or "") not in ("", "no_edge")
+        ]
+        best_signal_ev = 0.0
+        if signals:
+            best_signal_ev = max(
+                self._safe_float(row.get("decision_ev_per_usd"))
+                for row in signals
+            )
+
+        closed_count = len(closed)
+        entry_count = len(entries)
+        win_rate = (wins / closed_count * 100.0) if closed_count else None
+        avg_ev = (ev_sum / ev_count) if ev_count else 0.0
+        avg_edge = (edge_sum / ev_count) if ev_count else 0.0
+        maker_rate = (maker_entries / entry_count * 100.0) if entry_count else 0.0
+
+        recommendations = []
+        if entry_count == 0:
+            recommendations.append(
+                "Sin entradas en la ventana: mantener recogida o relajar ligeramente core si buscamos mas muestra."
+            )
+        elif closed_count < 5:
+            recommendations.append("Muestra pequena: no ajustar todavia salvo que siga varias horas sin entradas.")
+        if closed_count >= 5 and pnl < 0 and (win_rate or 0.0) < 45.0:
+            recommendations.append("PnL y win-rate flojos: subir min_ev/edge antes de pensar en production.")
+        if closed_count >= 5 and pnl > 0 and maker_rate >= 50.0:
+            recommendations.append("Dry run saludable: mantener parametros y ampliar muestra.")
+        if momentum_entries == 0:
+            recommendations.append("Momentum sigue sin muestra: revisar manana si conviene bajar su confianza/EV otro poco.")
+        elif momentum_entries >= 3 and momentum_pnl < 0:
+            recommendations.append("Momentum negativo: endurecerlo o pausarlo.")
+        if taker_entries > maker_entries and pnl <= 0:
+            recommendations.append("Demasiado taker sin PnL positivo: priorizar maker o subir EV taker.")
+        if best_signal_ev < float(getattr(self, "fair_value_min_ev_per_usd", 0.0)) and entry_count == 0:
+            recommendations.append("El mejor EV observado no llega al umbral actual.")
+
+        recommendation = " ".join(recommendations) if recommendations else "Sin cambios recomendados; seguir acumulando datos."
+        return {
+            "event_ts_utc": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+            "mode": "recommendation_only",
+            "safety_status": "dry_run_only_no_autochanges",
+            "lookback_hours": round(lookback / 3600.0, 3),
+            "strategy_mode": self.strategy_mode,
+            "dry_run": bool(self.dry_run),
+            "live_trading_enabled": bool(getattr(self, "fair_value_live_trading_enabled", False)),
+            "stake_usd": round(float(getattr(self, "fair_value_stake_usd", 0.0)), 4),
+            "core_edge": round(float(getattr(self, "fair_value_min_taker_edge", 0.0)), 6),
+            "core_ev": round(float(getattr(self, "fair_value_min_ev_per_usd", 0.0)), 6),
+            "momentum_edge": round(float(getattr(self, "fair_value_momentum_min_edge", 0.0)), 6),
+            "momentum_ev": round(float(getattr(self, "fair_value_momentum_min_ev_per_usd", 0.0)), 6),
+            "entries": entry_count,
+            "closed": closed_count,
+            "open": len(open_entries),
+            "wins": wins,
+            "losses": losses,
+            "win_rate": round(win_rate, 2) if win_rate is not None else "",
+            "pnl_usd": round(pnl, 4),
+            "core_entries": core_entries,
+            "core_pnl": round(core_pnl, 4),
+            "momentum_entries": momentum_entries,
+            "momentum_pnl": round(momentum_pnl, 4),
+            "maker_entries": maker_entries,
+            "taker_entries": taker_entries,
+            "maker_rate": round(maker_rate, 2),
+            "avg_ev_per_usd": round(avg_ev, 6),
+            "avg_edge_probability": round(avg_edge, 6),
+            "max_stake": round(max_stake, 4),
+            "signals": len(signals),
+            "candidate_signals": len(candidate_signals),
+            "best_signal_ev_per_usd": round(best_signal_ev, 6),
+            "recommendation": recommendation,
+        }
+
+    async def _fair_value_supervisor_if_due(self, now_ts: float):
+        allowed, reason = self._fair_value_supervisor_allowed()
+        interval = max(float(getattr(self, "fair_value_supervisor_interval_seconds", 7200.0)), 300.0)
+        if not allowed:
+            last_disabled = float(getattr(self, "_last_supervisor_disabled_log_ts", 0.0) or 0.0)
+            if reason.startswith("live") and now_ts - last_disabled >= interval:
+                self.log(f"[Supervisor] Recommendation supervisor disabled for safety: {reason}.")
+                self._last_supervisor_disabled_log_ts = now_ts
+            return
+        last_review = self._last_supervisor_review_ts
+        if last_review is not None and now_ts - float(last_review) < interval:
+            return
+        self._last_supervisor_review_ts = now_ts
+        review = await asyncio.to_thread(self._build_fair_value_supervisor_review, now_ts)
+        self._schedule_csv_row("fair_value_supervisor_reviews.csv", review)
+        self.log(
+            "[Supervisor] Last "
+            f"{review['lookback_hours']:.1f}h | entries={review['entries']} "
+            f"closed={review['closed']} W/L={review['wins']}/{review['losses']} "
+            f"pnl=${review['pnl_usd']:.2f} | core={review['core_entries']} "
+            f"momentum={review['momentum_entries']} | maker={review['maker_entries']} "
+            f"taker={review['taker_entries']} | rec={review['recommendation']}"
+        )
+
+    def _fair_value_entry_model_retrain_allowed(self) -> Tuple[bool, str]:
+        if not bool(getattr(self, "fair_value_entry_model_auto_retrain_enabled", True)):
+            return False, "disabled"
+        if not bool(getattr(self, "fair_value_entry_model_enabled", True)):
+            return False, "entry_model_disabled"
+        if not self._is_fair_value_mode():
+            return False, "not_fair_value"
+        if not bool(self.dry_run):
+            return False, "live_dry_run_false"
+        if bool(getattr(self, "fair_value_live_trading_enabled", False)):
+            return False, "live_orders_enabled"
+        script_path = os.path.abspath(
+            os.path.join(os.path.dirname(__file__), "..", "scripts", "retrain_fair_value_entry_model.py")
+        )
+        if not os.path.exists(script_path):
+            return False, "script_missing"
+        return True, "dry_run_validated_promotion"
+
+    async def _fair_value_entry_model_retrain_if_due(self, now_ts: float):
+        allowed, reason = self._fair_value_entry_model_retrain_allowed()
+        interval = max(
+            float(getattr(self, "fair_value_entry_model_auto_retrain_interval_seconds", 7200.0)),
+            1800.0,
+        )
+        if not allowed:
+            if reason.startswith("live"):
+                last_disabled = float(getattr(self, "_last_supervisor_disabled_log_ts", 0.0) or 0.0)
+                if now_ts - last_disabled >= interval:
+                    self.log(f"[FairValueModel] Auto retrain disabled for safety: {reason}.")
+                    self._last_supervisor_disabled_log_ts = now_ts
+            return
+        if bool(getattr(self, "_entry_model_retrain_running", False)):
+            return
+        last_retrain = float(getattr(self, "_last_entry_model_retrain_ts", 0.0) or 0.0)
+        if last_retrain and now_ts - last_retrain < interval:
+            return
+        self._last_entry_model_retrain_ts = now_ts
+        self._entry_model_retrain_running = True
+        task = asyncio.create_task(self._run_fair_value_entry_model_retrain())
+        self._background_tasks.add(task)
+        task.add_done_callback(self._background_tasks.discard)
+
+    async def _run_fair_value_entry_model_retrain(self):
+        script_path = os.path.abspath(
+            os.path.join(os.path.dirname(__file__), "..", "scripts", "retrain_fair_value_entry_model.py")
+        )
+        root_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+        min_holdout = int(getattr(self, "fair_value_entry_model_auto_retrain_min_holdout_rows", 80) or 80)
+        args = [
+            PYTHON_EXE,
+            script_path,
+            "--promote",
+            "--min-holdout-rows",
+            str(max(min_holdout, 20)),
+        ]
+        self.log(
+            "[FairValueModel] Auto retrain started | "
+            f"interval={float(getattr(self, 'fair_value_entry_model_auto_retrain_interval_seconds', 7200.0)) / 3600.0:.1f}h | "
+            "dry-run-only validated promotion."
+        )
+        try:
+            process = await asyncio.create_subprocess_exec(
+                *args,
+                cwd=root_dir,
+                env=os.environ.copy(),
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            stdout_bytes, stderr_bytes = await process.communicate()
+            stdout = stdout_bytes.decode("utf-8", errors="replace").strip()
+            stderr = stderr_bytes.decode("utf-8", errors="replace").strip()
+            if process.returncode != 0:
+                details = stderr or stdout or f"exit_code={process.returncode}"
+                self.log(f"[FairValueModel] Auto retrain failed: {details[-300:]}")
+                return
+
+            report_path = os.path.join(self.data_dir, "fair_value_entry_model_retrain_report.json")
+            promoted = False
+            candidate_auc = current_auc = candidate_brier = current_brier = None
+            try:
+                with open(report_path, "r", encoding="utf-8") as f:
+                    report = json.load(f)
+                promoted = bool(report.get("promoted"))
+                candidate_auc = (report.get("candidate_holdout") or {}).get("auc")
+                current_auc = (report.get("current_holdout") or {}).get("auc")
+                candidate_brier = (report.get("candidate_holdout") or {}).get("brier")
+                current_brier = (report.get("current_holdout") or {}).get("brier")
+            except Exception:
+                pass
+
+            self._fair_value_entry_model = None
+            self._fair_value_entry_model_loaded_path = None
+            self._fair_value_entry_model_loaded_mtime = None
+            summary = stdout.splitlines()[0] if stdout else "completed"
+            if candidate_auc is not None and current_auc is not None:
+                summary = (
+                    f"candidate_auc={float(candidate_auc):.4f} current_auc={float(current_auc):.4f} "
+                    f"candidate_brier={float(candidate_brier):.4f} current_brier={float(current_brier):.4f}"
+                )
+            self.log(
+                "[FairValueModel] Auto retrain completed | "
+                f"promoted={promoted} | {summary}"
+            )
+        finally:
+            self._entry_model_retrain_running = False
 
     def _maker_touch_signal(self, book_metrics: Dict, maker_price: Optional[float]) -> bool:
         if maker_price is None:
@@ -993,14 +1697,20 @@ class CopyTrader:
 
         http_session = await self._get_http_session()
         url = f"https://clob.polymarket.com/book?token_id={asset_id}"
+        data = None
+        last_exc = None
         try:
-            async with http_session.get(url, timeout=aiohttp.ClientTimeout(total=5)) as response:
-                if response.status == 200:
-                    data = await response.json()
-                    if isinstance(data, dict):
-                        return data
-        except Exception:
-            pass
+            if not self._polymarket_backoff_active(url):
+                async with http_session.get(url, timeout=aiohttp.ClientTimeout(total=5)) as response:
+                    if response.status == 200:
+                        data = await response.json()
+                        self._mark_polymarket_http_success(url)
+        except Exception as exc:
+            last_exc = exc
+        if not data and last_exc is not None:
+            data = await self._polymarket_get_json_fallback(url, timeout=6.0)
+        if isinstance(data, dict):
+            return data
         return {"bids": [], "asks": []}
 
     async def _record_maker_orderbook_snapshot(
@@ -1410,6 +2120,2265 @@ class CopyTrader:
             "hypothetical_maker_fee": 0.0,
         })
         return result
+
+    def _record_fair_value_signal(self, row: Dict):
+        self._schedule_csv_row("fair_value_signals.csv", row)
+
+    def _record_fair_value_entry(self, row: Dict):
+        self._schedule_csv_row("fair_value_entries.csv", row)
+
+    def _record_fair_value_maker_event(self, row: Dict):
+        self._schedule_csv_row("fair_value_maker_events.csv", row)
+
+    def _record_fair_value_outcome(self, row: Dict):
+        self._schedule_csv_row("fair_value_outcomes.csv", row)
+
+    def _record_fair_value_giro_probe_entry(self, row: Dict):
+        self._schedule_csv_row("fair_value_giro_probe_entries.csv", row)
+
+    def _record_fair_value_giro_probe_outcome(self, row: Dict):
+        self._schedule_csv_row("fair_value_giro_probe_outcomes.csv", row)
+
+    def _fair_value_latest_price_after(self, boundary_ts: float) -> Tuple[Optional[float], Optional[int], Optional[float]]:
+        return self._chainlink_latest_sample_after(boundary_ts)
+
+    def _fair_value_signal_interval_elapsed(self, state: Dict, now_ts: float) -> bool:
+        last = float(state.get("last_signal_sample_at", 0.0) or 0.0)
+        sample_seconds = max(float(getattr(self, "fair_value_sample_seconds", 1.0)), 0.1)
+        return now_ts - last >= sample_seconds
+
+    def _fair_value_stake(self, price: float) -> float:
+        configured = max(float(getattr(self, "fair_value_stake_usd", 1.0)), 0.01)
+        minimum = float(getattr(self, "polymarket_min_market_buy_usd", 1.0) or 1.0)
+        p = max(float(price), 0.01)
+        # Limit orders also need at least 5 shares in practice; for maker
+        # candidates the decision helper checks that separately.
+        return round(max(configured, minimum if configured * (1.0 / p) > 0 else configured), 2)
+
+    def _fair_value_shadow_dynamic_stake(
+        self,
+        tactic: str,
+        base_stake_usd: float,
+        edge_probability: float,
+        ev_per_usd: float,
+        entry_model_win_probability: float,
+        price_margin: float,
+        continuation_probability: float,
+    ) -> Dict:
+        tactic_key = str(tactic or "core_edge")
+        base = round(max(float(base_stake_usd or 0.0), 0.0), 4)
+        enabled = bool(getattr(self, "fair_value_shadow_dynamic_stake_enabled", True))
+        eligible = tactic_key in ("momentum", "late_continuation")
+        if not enabled or not eligible or base <= 0:
+            return {
+                "shadow_dynamic_stake_enabled": False,
+                "shadow_stake_usd": base,
+                "shadow_stake_multiplier": 1.0,
+                "shadow_stake_reason": "disabled" if not enabled else "not_eligible",
+            }
+
+        p = max(float(entry_model_win_probability or 0.0), 0.0)
+        ev = max(float(ev_per_usd or 0.0), 0.0)
+        edge = max(float(edge_probability or 0.0), 0.0)
+        margin = max(float(price_margin or 0.0), 0.0)
+        continuation = max(float(continuation_probability or 0.0), 0.0)
+        multiplier = 1.0
+        reasons = ["base"]
+
+        if tactic_key == "momentum":
+            if p >= 0.70:
+                multiplier += 0.25
+                reasons.append("model_p>=0.70")
+            if p >= 0.80:
+                multiplier += 0.25
+                reasons.append("model_p>=0.80")
+        elif tactic_key == "late_continuation":
+            if p >= 0.91 or continuation >= 0.91:
+                multiplier += 0.25
+                reasons.append("late_p>=0.91")
+            if p >= 0.95 or continuation >= 0.95:
+                multiplier += 0.25
+                reasons.append("late_p>=0.95")
+
+        if ev >= 0.12:
+            multiplier += 0.25
+            reasons.append("ev>=0.12")
+        if ev >= 0.22:
+            multiplier += 0.25
+            reasons.append("ev>=0.22")
+        if edge >= 0.08:
+            multiplier += 0.25
+            reasons.append("edge>=0.08")
+        if margin >= 0.06:
+            multiplier += 0.25
+            reasons.append("margin>=0.06")
+
+        min_multiplier = min(
+            max(float(getattr(self, "fair_value_shadow_dynamic_stake_min_multiplier", 1.0)), 0.01),
+            10.0,
+        )
+        max_multiplier = min(
+            max(float(getattr(self, "fair_value_shadow_dynamic_stake_max_multiplier", 2.0)), min_multiplier),
+            10.0,
+        )
+        clear_for_175 = (
+            ev >= 0.12
+            and edge >= 0.07
+            and (p >= 0.70 or continuation >= 0.90)
+        )
+        clear_for_2x = (
+            ev >= 0.18
+            and edge >= 0.09
+            and (p >= 0.78 or continuation >= 0.93)
+        ) or (
+            ev >= 0.24
+            and edge >= 0.12
+        )
+        if multiplier > 1.5 and not clear_for_175:
+            multiplier = 1.5
+            reasons.append("cap_1.50_quality")
+        if multiplier > 1.75 and not clear_for_2x:
+            multiplier = 1.75
+            reasons.append("cap_1.75_not_clear_2x")
+        multiplier = min(max(multiplier, min_multiplier), max_multiplier)
+        return {
+            "shadow_dynamic_stake_enabled": True,
+            "shadow_stake_usd": round(base * multiplier, 4),
+            "shadow_stake_multiplier": round(multiplier, 4),
+            "shadow_stake_reason": "|".join(reasons),
+        }
+
+    def _load_fair_value_entry_model(self):
+        path = str(
+            getattr(self, "fair_value_entry_model_path", "")
+            or os.path.join(self.data_dir, "fair_value_entry_model.json")
+        )
+        try:
+            mtime = os.path.getmtime(path)
+        except OSError:
+            mtime = None
+        if (
+            self._fair_value_entry_model is not None
+            and self._fair_value_entry_model_loaded_path == path
+            and self._fair_value_entry_model_loaded_mtime == mtime
+        ):
+            return self._fair_value_entry_model
+        try:
+            model = load_entry_model(path)
+            if model is None:
+                fallback_path = os.path.join(
+                    os.path.dirname(__file__),
+                    "models",
+                    "fair_value_entry_model.json",
+                )
+                if os.path.abspath(fallback_path) != os.path.abspath(path):
+                    path = fallback_path
+                    try:
+                        mtime = os.path.getmtime(path)
+                    except OSError:
+                        mtime = None
+                    model = load_entry_model(path)
+        except Exception as exc:
+            now_ts = time.time()
+            if now_ts - float(getattr(self, "_last_fair_value_entry_model_warn_ts", 0.0) or 0.0) >= 60.0:
+                self._last_fair_value_entry_model_warn_ts = now_ts
+                self.log(f"[FairValueModel] Could not load entry model: {type(exc).__name__}: {str(exc)[:160]}")
+            self._fair_value_entry_model = None
+            self._fair_value_entry_model_loaded_path = path
+            self._fair_value_entry_model_loaded_mtime = mtime
+            return None
+        self._fair_value_entry_model = model
+        self._fair_value_entry_model_loaded_path = path
+        self._fair_value_entry_model_loaded_mtime = mtime
+        if model:
+            self.log(
+                "[FairValueModel] Entry model loaded | "
+                f"rows={model.get('train_rows', '?')} | "
+                f"auc={float(model.get('train_auc', 0.0) or 0.0):.3f} | "
+                f"brier={float(model.get('train_brier', 0.0) or 0.0):.3f}"
+            )
+        return model
+
+    def _load_cheap_reversal_model(self):
+        path = str(
+            getattr(self, "fair_value_giro_probe_model_path", "")
+            or os.path.join(self.data_dir, "cheap_reversal", "cheap_reversal_model.json")
+        )
+        try:
+            mtime = os.path.getmtime(path)
+        except OSError:
+            mtime = None
+        if (
+            getattr(self, "_cheap_reversal_model", None) is not None
+            and getattr(self, "_cheap_reversal_model_loaded_path", None) == path
+            and getattr(self, "_cheap_reversal_model_loaded_mtime", None) == mtime
+        ):
+            return self._cheap_reversal_model
+        try:
+            model = load_cheap_reversal_model(path)
+        except Exception as exc:
+            now_ts = time.time()
+            if now_ts - float(getattr(self, "_last_cheap_reversal_model_warn_ts", 0.0) or 0.0) >= 60.0:
+                self._last_cheap_reversal_model_warn_ts = now_ts
+                self.log(f"[CheapReversalModel] Could not load model: {type(exc).__name__}: {str(exc)[:160]}")
+            self._cheap_reversal_model = None
+            self._cheap_reversal_model_loaded_path = path
+            self._cheap_reversal_model_loaded_mtime = mtime
+            return None
+        self._cheap_reversal_model = model
+        self._cheap_reversal_model_loaded_path = path
+        self._cheap_reversal_model_loaded_mtime = mtime
+        if model:
+            metrics = model.get("training_metrics") or {}
+            self.log(
+                "[CheapReversalModel] Model loaded | "
+                f"version={model.get('model_version', '?')} | "
+                f"rows={metrics.get('rows', '?')} | "
+                f"auc={float(metrics.get('auc', 0.0) or 0.0):.3f} | "
+                f"brier={float(metrics.get('brier', 0.0) or 0.0):.3f}"
+            )
+        return model
+
+    def _cheap_reversal_candidate_features(
+        self,
+        fair_data: Dict,
+        side: str,
+        metrics: Dict,
+        price: float,
+        elapsed: float,
+    ) -> Dict:
+        try:
+            delta_bps = float(fair_data.get("delta_bps") or 0.0)
+        except (TypeError, ValueError):
+            delta_bps = 0.0
+        elapsed = float(elapsed)
+        elapsed_minutes = elapsed / 60.0 if elapsed > 0 else 0.0
+        raw_yes = float(fair_data.get("raw_fair_yes") or fair_data.get("fair_yes") or 0.5)
+        fair_yes = float(fair_data.get("fair_yes") or 0.5)
+        market_yes_raw = fair_data.get("market_fair_yes")
+        try:
+            market_yes = float(market_yes_raw)
+        except (TypeError, ValueError):
+            market_yes = 0.5
+        if side == "Yes":
+            fair_probability = fair_yes
+            raw_probability = raw_yes
+            market_probability = market_yes
+        else:
+            fair_probability = 1.0 - fair_yes
+            raw_probability = 1.0 - raw_yes
+            market_probability = 1.0 - market_yes
+        return {
+            "elapsed_s": elapsed,
+            "remaining_s": max(300.0 - elapsed, 0.0),
+            "elapsed_fraction": min(max(elapsed / 300.0, 0.0), 1.0),
+            "price": float(price),
+            "maker_price": float(metrics.get("best_bid") or 0.0),
+            "side_spread": float(metrics.get("spread") or 0.0),
+            "side_mid": float(metrics.get("mid") or 0.0),
+            "side_bid_depth_40_60": float(metrics.get("bid_depth_40_60") or 0.0),
+            "side_ask_depth_40_60": float(metrics.get("ask_depth_40_60") or 0.0),
+            "is_yes": 1.0 if side == "Yes" else 0.0,
+            "delta_bps": delta_bps,
+            "abs_delta_bps": abs(delta_bps),
+            "velocity_bps_per_min": delta_bps / elapsed_minutes if elapsed_minutes > 0 else 0.0,
+            "fair_probability": fair_probability,
+            "raw_fair_probability": raw_probability,
+            "market_probability": market_probability,
+            "confidence": float(fair_data.get("confidence") or 0.0),
+            "continuation_probability": float(fair_data.get("continuation_probability") or 0.5),
+            "contrarian_probability": float(fair_data.get("contrarian_probability") or 0.5),
+            "kalman_delta_bps": float(fair_data.get("kalman_delta_bps") or 0.0),
+            "kalman_velocity_bps_per_min": float(fair_data.get("kalman_velocity_bps_per_min") or 0.0),
+            "kalman_projected_delta_bps": float(fair_data.get("kalman_projected_delta_bps") or 0.0),
+            "kalman_residual_bps": float(fair_data.get("kalman_residual_bps") or 0.0),
+            "kalman_abs_residual_bps": float(fair_data.get("kalman_abs_residual_bps") or 0.0),
+            "kalman_uncertainty_bps": float(fair_data.get("kalman_uncertainty_bps") or 0.0),
+            "kalman_trend_agreement": float(fair_data.get("kalman_trend_agreement") or 0.0),
+        }
+
+    def _fair_value_entry_model_features(
+        self,
+        decision,
+        tactic: str,
+        elapsed: float,
+        state: Dict,
+    ) -> Dict:
+        price = max(float(getattr(decision, "price", 0.0) or 0.0), 0.01)
+        stake = self._fair_value_stake(price)
+        if tactic == "momentum":
+            stake = round(
+                stake * float(getattr(self, "fair_value_momentum_stake_multiplier", 1.0)),
+                2,
+            )
+        elif tactic == "late_continuation":
+            stake = round(
+                stake * float(getattr(self, "fair_value_late_continuation_stake_multiplier", 1.0)),
+                2,
+            )
+        kalman_features = ((state.get("kalman") or {}).get("features") or {})
+        fee = 0.0 if str(getattr(decision, "route", "")).startswith("maker") else taker_fee_for_stake(
+            stake,
+            price,
+            float(getattr(self, "martingale_taker_fee_rate", 0.07)),
+        )
+        return {
+            "entry_number": len(self._fair_value_entries(state)) + 1,
+            "price": price,
+            "elapsed": float(elapsed),
+            "edge": float(getattr(decision, "edge_probability", 0.0) or 0.0),
+            "fair": float(getattr(decision, "fair_probability", 0.0) or 0.0),
+            "ev": float(getattr(decision, "ev_per_usd", 0.0) or 0.0),
+            "fee": fee,
+            "direction_yes": 1.0 if getattr(decision, "side", "") == "Yes" else 0.0,
+            "route_maker": 1.0 if str(getattr(decision, "route", "")).startswith("maker") else 0.0,
+            "route_taker": 1.0 if getattr(decision, "route", "") == "taker" else 0.0,
+            "tactic_momentum": 1.0 if tactic == "momentum" else 0.0,
+            "tactic_late_continuation": 1.0 if tactic == "late_continuation" else 0.0,
+            "is_late_60": 1.0 if float(elapsed) >= 60.0 else 0.0,
+            "is_late_180": 1.0 if float(elapsed) >= 180.0 else 0.0,
+            "kalman_delta_bps": float(kalman_features.get("kalman_delta_bps", 0.0) or 0.0),
+            "kalman_velocity_bps_per_min": float(kalman_features.get("kalman_velocity_bps_per_min", 0.0) or 0.0),
+            "kalman_projected_delta_bps": float(kalman_features.get("kalman_projected_delta_bps", 0.0) or 0.0),
+            "kalman_residual_bps": float(kalman_features.get("kalman_residual_bps", 0.0) or 0.0),
+            "kalman_abs_residual_bps": float(kalman_features.get("kalman_abs_residual_bps", 0.0) or 0.0),
+            "kalman_uncertainty_bps": float(kalman_features.get("kalman_uncertainty_bps", 0.0) or 0.0),
+            "kalman_trend_agreement": float(kalman_features.get("kalman_trend_agreement", 0.0) or 0.0),
+        }
+
+    def _fair_value_apply_entry_model_guard(
+        self,
+        decision,
+        tactic: str,
+        elapsed: float,
+        state: Dict,
+    ):
+        if not decision or not decision.should_enter:
+            return decision
+        if not bool(getattr(self, "fair_value_entry_model_enabled", True)):
+            return decision
+        model = self._load_fair_value_entry_model()
+        if not model:
+            return decision
+        features = self._fair_value_entry_model_features(decision, tactic, elapsed, state)
+        probability = score_entry_candidate(model, features)
+        if tactic == "momentum":
+            minimum = float(getattr(self, "fair_value_momentum_entry_model_min_win_prob", 0.67))
+            maximum = 1.0
+        elif tactic == "late_continuation":
+            minimum = float(getattr(self, "fair_value_late_continuation_entry_model_min_win_prob", 0.0))
+            maximum = 1.0
+        else:
+            minimum = float(getattr(self, "fair_value_core_entry_model_min_win_prob", 0.47))
+            maximum = float(getattr(self, "fair_value_core_entry_model_max_win_prob", 0.50))
+        minimum = min(max(minimum, 0.0), 1.0)
+        maximum = min(max(maximum, minimum), 1.0)
+        if probability < minimum:
+            return replace(
+                decision,
+                should_enter=False,
+                entry_model_win_probability=round(float(probability), 6),
+                entry_model_min_probability=round(float(minimum), 6),
+                entry_model_enabled=True,
+                reason=f"entry_model_guard_{probability:.3f}_lt_{minimum:.3f}",
+            )
+        if probability > maximum:
+            return replace(
+                decision,
+                should_enter=False,
+                entry_model_win_probability=round(float(probability), 6),
+                entry_model_min_probability=round(float(minimum), 6),
+                entry_model_enabled=True,
+                reason=f"entry_model_guard_{probability:.3f}_gt_{maximum:.3f}",
+            )
+        return replace(
+            decision,
+            entry_model_win_probability=round(float(probability), 6),
+            entry_model_min_probability=round(float(minimum), 6),
+            entry_model_enabled=True,
+        )
+
+    def _fair_value_apply_core_direction_filter(self, decision, fair_data: Dict):
+        if not decision or not decision.should_enter:
+            return decision
+        if not bool(getattr(self, "fair_value_core_contrarian_only", False)):
+            return decision
+        delta = fair_data.get("delta_usd")
+        try:
+            delta_value = float(delta)
+        except (TypeError, ValueError):
+            delta_value = 0.0
+        if abs(delta_value) < 1e-9:
+            return replace(decision, should_enter=False, reason="core_contrarian_no_delta")
+        is_contrarian = (
+            (delta_value > 0 and decision.side == "No")
+            or (delta_value < 0 and decision.side == "Yes")
+        )
+        if not is_contrarian:
+            return replace(decision, should_enter=False, reason="core_contrarian_only")
+        return decision
+
+    def _fair_value_orderbook_row(
+        self,
+        slug: str,
+        elapsed: float,
+        token_ids: List[str],
+        yes_book: Dict,
+        no_book: Dict,
+        fair_data: Dict,
+        decision,
+        opening_price: Optional[float],
+        latest_price: Optional[float],
+        latest_offset: Optional[float],
+        state: Dict,
+        tactic: str = "",
+    ) -> Dict:
+        row = self._build_orderbook_sample_row(
+            slug=slug,
+            elapsed=elapsed,
+            token_ids=token_ids,
+            yes_book=yes_book,
+            no_book=no_book,
+            target_direction=decision.side if decision and decision.should_enter else "",
+            maker_price=decision.maker_price if decision and decision.route == "maker" else None,
+        )
+        row.update({
+            "model_version": "btc_empirical_continuation_market_blend_v4",
+            "price_source": fair_data.get("price_source", ""),
+            "opening_price": round(float(opening_price), 8) if opening_price else "",
+            "latest_price": round(float(latest_price), 8) if latest_price else "",
+            "latest_offset_s": round(float(latest_offset), 3) if latest_offset is not None else "",
+            "model_family": fair_data.get("model_family", ""),
+            "continuation_probability": fair_data.get("continuation_probability", ""),
+            "contrarian_probability": fair_data.get("contrarian_probability", ""),
+            "raw_fair_yes": fair_data.get("raw_fair_yes", ""),
+            "raw_fair_no": fair_data.get("raw_fair_no", ""),
+            "market_fair_yes": fair_data.get("market_fair_yes", ""),
+            "market_blend_weight": fair_data.get("market_blend_weight", ""),
+            "fair_yes": fair_data.get("fair_yes"),
+            "fair_no": fair_data.get("fair_no"),
+            "delta_usd": fair_data.get("delta_usd") if fair_data.get("delta_usd") is not None else "",
+            "delta_bps": fair_data.get("delta_bps") if fair_data.get("delta_bps") is not None else "",
+            "confidence": fair_data.get("confidence"),
+            "kalman_delta_bps": fair_data.get("kalman_delta_bps", ""),
+            "kalman_velocity_bps_per_min": fair_data.get("kalman_velocity_bps_per_min", ""),
+            "kalman_projected_delta_bps": fair_data.get("kalman_projected_delta_bps", ""),
+            "kalman_residual_bps": fair_data.get("kalman_residual_bps", ""),
+            "kalman_abs_residual_bps": fair_data.get("kalman_abs_residual_bps", ""),
+            "kalman_uncertainty_bps": fair_data.get("kalman_uncertainty_bps", ""),
+            "kalman_trend_agreement": fair_data.get("kalman_trend_agreement", ""),
+            "decision_side": decision.side if decision else "",
+            "decision_route": decision.route if decision else "",
+            "decision_price": decision.price if decision else "",
+            "decision_edge_probability": decision.edge_probability if decision else "",
+            "decision_ev_per_usd": decision.ev_per_usd if decision else "",
+            "decision_break_even_price": decision.break_even_price if decision else "",
+            "decision_max_acceptable_price": decision.max_acceptable_price if decision else "",
+            "decision_price_margin": decision.price_margin if decision else "",
+            "decision_continuation_probability": decision.continuation_probability if decision else "",
+            "decision_abs_delta_bps": decision.abs_delta_bps if decision else "",
+            "decision_entry_model_win_probability": (
+                decision.entry_model_win_probability
+                if decision and getattr(decision, "entry_model_enabled", False)
+                else ""
+            ),
+            "decision_entry_model_min_probability": (
+                decision.entry_model_min_probability
+                if decision and getattr(decision, "entry_model_enabled", False)
+                else ""
+            ),
+            "decision_entry_model_enabled": (
+                bool(getattr(decision, "entry_model_enabled", False)) if decision else False
+            ),
+            "decision_reason": decision.reason if decision else "",
+            "decision_tactic": tactic,
+            "active_entry_done": bool(self._fair_value_entries(state)),
+            "open_entry_count": len(self._fair_value_entries(state)),
+            "maker_candidate_active": bool(state.get("maker_candidate")),
+        })
+        return row
+
+    async def _fair_value_market_context(self, slug: str, market_data: Dict) -> Optional[Dict]:
+        token_ids = self._extract_clob_token_ids(market_data)
+        if len(token_ids) != 2:
+            return None
+        yes_book, no_book = await asyncio.gather(
+            self.fetch_order_book(token_ids[0]),
+            self.fetch_order_book(token_ids[1]),
+            return_exceptions=True,
+        )
+        if isinstance(yes_book, Exception):
+            yes_book = {"bids": [], "asks": []}
+        if isinstance(no_book, Exception):
+            no_book = {"bids": [], "asks": []}
+        yes_metrics = self._orderbook_metrics(yes_book)
+        no_metrics = self._orderbook_metrics(no_book)
+        return {
+            "slug": slug,
+            "token_ids": token_ids,
+            "yes_book": yes_book,
+            "no_book": no_book,
+            "yes_metrics": yes_metrics,
+            "no_metrics": no_metrics,
+        }
+
+    def _fair_value_decision(
+        self,
+        fair_yes: float,
+        yes_metrics: Dict,
+        no_metrics: Dict,
+        state: Dict,
+        fair_data: Optional[Dict] = None,
+    ):
+        prefer_maker = bool(getattr(self, "fair_value_prefer_maker", True))
+        min_taker_edge = max(
+            float(getattr(self, "fair_value_min_taker_edge", 0.10)),
+            float(getattr(self, "fair_value_taker_guard_min_edge", 0.06)),
+        )
+        allowed_sides = None
+        if bool(getattr(self, "fair_value_core_contrarian_only", False)):
+            delta = (fair_data or {}).get("delta_usd")
+            try:
+                delta_value = float(delta)
+            except (TypeError, ValueError):
+                delta_value = 0.0
+            if delta_value > 0:
+                allowed_sides = {"No"}
+            elif delta_value < 0:
+                allowed_sides = {"Yes"}
+            else:
+                return FairValueDecision(should_enter=False, reason="core_contrarian_no_delta")
+        allow_maker = not (
+            not self.dry_run
+            and bool(getattr(self, "fair_value_live_trading_enabled", False))
+            and state.get("maker_attempted_slug") == state.get("active_slug")
+        )
+        decision = best_decision(
+            fair_yes=fair_yes,
+            yes_metrics=yes_metrics,
+            no_metrics=no_metrics,
+            min_taker_edge=min_taker_edge,
+            min_maker_edge=float(getattr(self, "fair_value_min_maker_edge", 0.10)),
+            min_ev_per_usd=float(getattr(self, "fair_value_min_ev_per_usd", 0.30)),
+            min_price=float(getattr(
+                self,
+                "fair_value_core_min_price",
+                getattr(self, "fair_value_min_price", 0.35),
+            )),
+            max_price=float(getattr(
+                self,
+                "fair_value_core_max_price",
+                getattr(self, "fair_value_max_price", 0.50),
+            )),
+            fee_rate=float(getattr(self, "martingale_taker_fee_rate", 0.07)),
+            prefer_maker=prefer_maker,
+            min_limit_shares=float(getattr(self, "polymarket_min_limit_order_shares", 5.0) or 5.0),
+            stake_usd=float(getattr(self, "fair_value_stake_usd", 1.0)),
+            allow_maker=allow_maker,
+            allowed_sides=allowed_sides,
+        )
+        return self._fair_value_apply_taker_guard(decision)
+
+    def _fair_value_apply_taker_guard(self, decision):
+        if not decision or not decision.should_enter or decision.route != "taker":
+            return decision
+        min_edge = float(getattr(self, "fair_value_taker_guard_min_edge", 0.06))
+        min_ev = float(getattr(self, "fair_value_taker_guard_min_ev_per_usd", 0.12))
+        if float(decision.edge_probability or 0.0) < min_edge:
+            return FairValueDecision(should_enter=False, reason="taker_guard_edge")
+        if float(decision.ev_per_usd or 0.0) < min_ev:
+            return FairValueDecision(should_enter=False, reason="taker_guard_ev")
+        return decision
+
+    def _fair_value_momentum_decision(
+        self,
+        fair_yes: float,
+        fair_data: Dict,
+        yes_metrics: Dict,
+        no_metrics: Dict,
+    ):
+        confidence = float(fair_data.get("confidence") or 0.0)
+        min_confidence = float(getattr(self, "fair_value_momentum_min_confidence", 0.55))
+        if confidence < min_confidence:
+            return FairValueDecision(should_enter=False)
+        return best_decision(
+            fair_yes=fair_yes,
+            yes_metrics=yes_metrics,
+            no_metrics=no_metrics,
+            min_taker_edge=max(
+                float(getattr(self, "fair_value_momentum_min_edge", 0.02)),
+                float(getattr(self, "fair_value_taker_guard_min_edge", 0.06)),
+            ),
+            min_maker_edge=1.0,
+            min_ev_per_usd=max(
+                float(getattr(self, "fair_value_momentum_min_ev_per_usd", 0.05)),
+                float(getattr(self, "fair_value_taker_guard_min_ev_per_usd", 0.12)),
+            ),
+            min_price=float(getattr(self, "fair_value_min_price", 0.35)),
+            max_price=float(getattr(self, "fair_value_momentum_max_price", 0.90)),
+            fee_rate=float(getattr(self, "martingale_taker_fee_rate", 0.07)),
+            prefer_maker=False,
+            min_limit_shares=float(getattr(self, "polymarket_min_limit_order_shares", 5.0) or 5.0),
+            stake_usd=float(getattr(self, "fair_value_stake_usd", 1.0))
+            * float(getattr(self, "fair_value_momentum_stake_multiplier", 1.0)),
+            allow_taker=True,
+            allow_maker=False,
+        )
+
+    def _fair_value_max_taker_price_for_ev(
+        self,
+        fair_probability: float,
+        min_ev_per_usd: float,
+        fee_rate: float,
+    ) -> float:
+        target_ev = max(float(min_ev_per_usd), 0.0)
+        fair = min(max(float(fair_probability), 0.0), 1.0)
+        if fair <= 0.01:
+            return 0.0
+        if taker_ev_per_usd(fair, 0.01, fee_rate) < target_ev:
+            return 0.0
+        if taker_ev_per_usd(fair, 0.99, fee_rate) >= target_ev:
+            return 0.99
+        low, high = 0.01, 0.99
+        for _ in range(40):
+            mid = (low + high) / 2.0
+            if taker_ev_per_usd(fair, mid, fee_rate) >= target_ev:
+                low = mid
+            else:
+                high = mid
+        return round(low, 6)
+
+    def _fair_value_late_continuation_decision(
+        self,
+        fair_data: Dict,
+        yes_metrics: Dict,
+        no_metrics: Dict,
+        state: Dict,
+    ):
+        delta_bps = fair_data.get("delta_bps")
+        try:
+            delta_bps_value = float(delta_bps)
+        except (TypeError, ValueError):
+            return FairValueDecision(should_enter=False, reason="late_continuation_no_delta")
+
+        abs_delta_bps = abs(delta_bps_value)
+        min_abs_delta = float(getattr(self, "fair_value_late_continuation_min_abs_delta_bps", 5.0))
+        if abs_delta_bps < min_abs_delta:
+            return FairValueDecision(should_enter=False, reason="late_continuation_delta_too_small")
+
+        continuation_probability = float(fair_data.get("continuation_probability") or 0.5)
+        min_probability = float(getattr(self, "fair_value_late_continuation_min_probability", 0.87))
+        if continuation_probability < min_probability:
+            return FairValueDecision(should_enter=False, reason="late_continuation_probability_too_low")
+        max_probability = float(getattr(self, "fair_value_late_continuation_max_probability", 0.95))
+        if continuation_probability > max_probability:
+            return FairValueDecision(should_enter=False, reason="late_continuation_probability_too_high")
+
+        side = "Yes" if delta_bps_value > 0 else "No"
+        fair_yes = continuation_probability if side == "Yes" else 1.0 - continuation_probability
+        min_ev = float(getattr(self, "fair_value_late_continuation_min_ev_per_usd", 0.015))
+        fee_rate = float(getattr(self, "martingale_taker_fee_rate", 0.07))
+        break_even_price = self._fair_value_max_taker_price_for_ev(
+            continuation_probability,
+            0.0,
+            fee_rate,
+        )
+        ev_max_price = self._fair_value_max_taker_price_for_ev(
+            continuation_probability,
+            min_ev,
+            fee_rate,
+        )
+        price_buffer = float(getattr(self, "fair_value_late_continuation_price_buffer", 0.01))
+        max_acceptable_price = max(ev_max_price - max(price_buffer, 0.0), 0.0)
+        max_acceptable_price = min(
+            max_acceptable_price,
+            float(getattr(self, "fair_value_late_continuation_max_price", 0.95)),
+        )
+        if max_acceptable_price <= 0:
+            return FairValueDecision(should_enter=False, reason="late_continuation_no_acceptable_price")
+
+        allow_maker = bool(getattr(self, "fair_value_prefer_maker", True))
+        if (
+            not self.dry_run
+            and bool(getattr(self, "fair_value_live_trading_enabled", False))
+            and state.get("maker_attempted_slug") == state.get("active_slug")
+        ):
+            allow_maker = False
+
+        decision = best_decision(
+            fair_yes=fair_yes,
+            yes_metrics=yes_metrics,
+            no_metrics=no_metrics,
+            min_taker_edge=0.0,
+            min_maker_edge=0.0,
+            min_ev_per_usd=min_ev,
+            min_price=float(getattr(self, "fair_value_min_price", 0.35)),
+            max_price=max_acceptable_price,
+            fee_rate=fee_rate,
+            prefer_maker=False,
+            min_limit_shares=float(getattr(self, "polymarket_min_limit_order_shares", 5.0) or 5.0),
+            stake_usd=float(getattr(self, "fair_value_stake_usd", 1.0))
+            * float(getattr(self, "fair_value_late_continuation_stake_multiplier", 1.0)),
+            allow_taker=True,
+            allow_maker=allow_maker,
+            allowed_sides={side},
+        )
+        if not decision or not decision.should_enter:
+            return replace(
+                FairValueDecision(should_enter=False, reason="late_continuation_no_price_edge"),
+                break_even_price=round(float(break_even_price), 6),
+                max_acceptable_price=round(float(max_acceptable_price), 6),
+                continuation_probability=round(float(continuation_probability), 6),
+                abs_delta_bps=round(float(abs_delta_bps), 6),
+            )
+
+        price_margin = float(max_acceptable_price) - float(decision.price or 0.0)
+        return replace(
+            decision,
+            reason="late_continuation",
+            break_even_price=round(float(break_even_price), 6),
+            max_acceptable_price=round(float(max_acceptable_price), 6),
+            price_margin=round(float(price_margin), 6),
+            continuation_probability=round(float(continuation_probability), 6),
+            abs_delta_bps=round(float(abs_delta_bps), 6),
+        )
+
+    def _fair_value_giro_probe_decision(
+        self,
+        fair_data: Dict,
+        yes_metrics: Dict,
+        no_metrics: Dict,
+        elapsed: float,
+    ):
+        if not bool(getattr(self, "fair_value_giro_probe_enabled", True)):
+            return FairValueDecision(should_enter=False, reason="giro_probe_disabled")
+        if not self.dry_run:
+            return FairValueDecision(should_enter=False, reason="giro_probe_dry_run_only")
+
+        start = float(getattr(self, "fair_value_giro_probe_start_seconds", 0.0))
+        end = float(getattr(self, "fair_value_giro_probe_end_seconds", 300.0))
+        if not (start <= float(elapsed) <= end):
+            return FairValueDecision(should_enter=False, reason="giro_probe_outside_time")
+
+        try:
+            delta_bps = float(fair_data.get("delta_bps"))
+        except (TypeError, ValueError):
+            return FairValueDecision(should_enter=False, reason="giro_probe_no_delta")
+        abs_delta_bps = abs(delta_bps)
+        min_abs_delta = float(getattr(self, "fair_value_giro_probe_min_abs_delta_bps", 0.5))
+        if abs_delta_bps < min_abs_delta:
+            return FairValueDecision(should_enter=False, reason="giro_probe_delta_too_small")
+
+        side = "No" if delta_bps > 0 else "Yes"
+        metrics = yes_metrics if side == "Yes" else no_metrics
+        price = float(metrics.get("best_ask") or 0.0)
+        min_price = float(getattr(self, "fair_value_giro_probe_min_price", 0.15))
+        max_price = float(getattr(self, "fair_value_giro_probe_max_price", 0.42))
+        if not (min_price <= price <= max_price):
+            return FairValueDecision(should_enter=False, reason="giro_probe_price_outside_range")
+
+        fair_raw = fair_data.get("fair_yes") if side == "Yes" else fair_data.get("fair_no")
+        raw_rule_probability = float(fair_raw or 0.0)
+        fair_probability = raw_rule_probability
+        model_enabled = False
+        model_version = ""
+        if bool(getattr(self, "fair_value_giro_probe_model_enabled", False)):
+            model = self._load_cheap_reversal_model()
+            if model:
+                features = self._cheap_reversal_candidate_features(
+                    fair_data=fair_data,
+                    side=side,
+                    metrics=metrics,
+                    price=price,
+                    elapsed=elapsed,
+                )
+                fair_probability = score_cheap_reversal_candidate(model, features)
+                model_enabled = True
+                model_version = str(model.get("model_version") or "")
+        fee_rate = float(getattr(self, "martingale_taker_fee_rate", 0.07))
+        breakeven = taker_breakeven_probability(price, fee_rate)
+        edge = fair_probability - breakeven
+        ev = taker_ev_per_usd(fair_probability, price, fee_rate)
+        min_probability = float(getattr(self, "fair_value_giro_probe_min_probability", 0.45))
+        if fair_probability < min_probability:
+            return FairValueDecision(
+                should_enter=False,
+                reason="giro_probe_probability_too_low",
+                fair_probability=round(fair_probability, 6),
+                cheap_reversal_model_probability=round(fair_probability, 6) if model_enabled else 0.0,
+                cheap_reversal_model_enabled=model_enabled,
+                cheap_reversal_model_version=model_version,
+                cheap_reversal_raw_probability=round(raw_rule_probability, 6),
+            )
+        min_ev = float(getattr(self, "fair_value_giro_probe_min_ev_per_usd", 0.05))
+        if ev < min_ev:
+            return FairValueDecision(
+                should_enter=False,
+                reason="giro_probe_ev_too_low",
+                fair_probability=round(fair_probability, 6),
+                edge_probability=round(edge, 6),
+                ev_per_usd=round(ev, 6),
+                cheap_reversal_model_probability=round(fair_probability, 6) if model_enabled else 0.0,
+                cheap_reversal_model_enabled=model_enabled,
+                cheap_reversal_model_version=model_version,
+                cheap_reversal_raw_probability=round(raw_rule_probability, 6),
+            )
+        confidence = float(fair_data.get("confidence") or 0.0)
+        min_confidence = float(getattr(self, "fair_value_giro_probe_min_confidence", 0.10))
+        if confidence < min_confidence:
+            return FairValueDecision(
+                should_enter=False,
+                reason="giro_probe_confidence_too_low",
+                fair_probability=round(fair_probability, 6),
+                edge_probability=round(edge, 6),
+                ev_per_usd=round(ev, 6),
+                cheap_reversal_model_probability=round(fair_probability, 6) if model_enabled else 0.0,
+                cheap_reversal_model_enabled=model_enabled,
+                cheap_reversal_model_version=model_version,
+                cheap_reversal_raw_probability=round(raw_rule_probability, 6),
+            )
+        return FairValueDecision(
+            should_enter=True,
+            side=side,
+            route="paper_taker",
+            price=round(price, 4),
+            fair_probability=round(fair_probability, 6),
+            edge_probability=round(edge, 6),
+            ev_per_usd=round(ev, 6),
+            fee_fraction=round(max(fee_rate, 0.0) * (1.0 - price), 6),
+            cheap_reversal_model_probability=round(fair_probability, 6) if model_enabled else 0.0,
+            cheap_reversal_model_enabled=model_enabled,
+            cheap_reversal_model_version=model_version,
+            cheap_reversal_raw_probability=round(raw_rule_probability, 6),
+            continuation_probability=round(float(fair_data.get("continuation_probability") or 0.5), 6),
+            abs_delta_bps=round(float(abs_delta_bps), 6),
+            reason="cheap_reversal_model" if model_enabled else "giro_probe_cheap_contrarian",
+        )
+
+    def _fair_value_giro_probe_allows(
+        self,
+        probe_state: Dict,
+        slug: str,
+        decision,
+    ) -> Tuple[bool, str]:
+        if not decision or not decision.should_enter:
+            return False, getattr(decision, "reason", "no_decision")
+        windows = probe_state.setdefault("windows", {})
+        entries = windows.setdefault(slug, [])
+        max_entries = int(getattr(self, "fair_value_giro_probe_max_entries_per_window", 4) or 0)
+        if max_entries > 0 and len(entries) >= max_entries:
+            return False, "giro_probe_window_limit"
+        price_step = float(getattr(self, "fair_value_giro_probe_min_price_step", 0.03))
+        for entry in entries:
+            if entry.get("direction") != decision.side:
+                continue
+            entry_price = float(entry.get("entry_price", 0.0) or 0.0)
+            if abs(entry_price - float(decision.price or 0.0)) < price_step:
+                return False, "giro_probe_duplicate_price_bucket"
+        return True, "ok"
+
+    def _record_fair_value_giro_probe_signal(
+        self,
+        probe_state: Dict,
+        slug: str,
+        decision,
+        fair_data: Dict,
+        token_ids: List[str],
+        elapsed: float,
+    ) -> bool:
+        allowed, reason = self._fair_value_giro_probe_allows(probe_state, slug, decision)
+        if not allowed:
+            return False
+
+        import datetime
+
+        token_index = 0 if decision.side == "Yes" else 1
+        token_id = token_ids[token_index] if token_index < len(token_ids) else ""
+        stake = round(
+            self._fair_value_stake(decision.price)
+            * float(getattr(self, "fair_value_giro_probe_stake_multiplier", 1.0)),
+            2,
+        )
+        price = max(float(decision.price), 0.01)
+        shares = round(stake / price, 4)
+        fee = taker_fee_for_stake(
+            stake,
+            price,
+            float(getattr(self, "martingale_taker_fee_rate", 0.07)),
+        )
+        entry_id = int(probe_state.get("next_entry_id", 1) or 1)
+        probe_state["next_entry_id"] = entry_id + 1
+        now_iso = datetime.datetime.now(datetime.timezone.utc).isoformat()
+        kalman_features = fair_data or {}
+        row = {
+            "event_ts_utc": now_iso,
+            "slug": slug,
+            "entry_id": entry_id,
+            "tactic": "giro_probe",
+            "dry_run": self.dry_run,
+            "live_trading_enabled": bool(getattr(self, "fair_value_live_trading_enabled", False)),
+            "direction": decision.side,
+            "target_token_id": token_id,
+            "route": decision.route,
+            "elapsed_s": round(float(elapsed), 3),
+            "price": round(price, 6),
+            "stake_usd": stake,
+            "shares": shares,
+            "fee_usd": fee,
+            "fair_probability": round(float(decision.fair_probability), 6),
+            "cheap_model_probability": round(float(getattr(decision, "cheap_reversal_model_probability", 0.0) or 0.0), 6),
+            "cheap_raw_probability": round(float(getattr(decision, "cheap_reversal_raw_probability", 0.0) or 0.0), 6),
+            "cheap_model_enabled": bool(getattr(decision, "cheap_reversal_model_enabled", False)),
+            "cheap_model_version": getattr(decision, "cheap_reversal_model_version", ""),
+            "edge_probability": round(float(decision.edge_probability), 6),
+            "ev_per_usd": round(float(decision.ev_per_usd), 6),
+            "trigger_reason": decision.reason,
+            "delta_bps": fair_data.get("delta_bps", ""),
+            "raw_fair_yes": fair_data.get("raw_fair_yes", ""),
+            "fair_yes": fair_data.get("fair_yes", ""),
+            "fair_no": fair_data.get("fair_no", ""),
+            "market_fair_yes": fair_data.get("market_fair_yes", ""),
+            "continuation_probability": fair_data.get("continuation_probability", ""),
+            "contrarian_probability": fair_data.get("contrarian_probability", ""),
+            "confidence": fair_data.get("confidence", ""),
+            "price_source": fair_data.get("price_source", ""),
+            "kalman_delta_bps": kalman_features.get("kalman_delta_bps", ""),
+            "kalman_velocity_bps_per_min": kalman_features.get("kalman_velocity_bps_per_min", ""),
+            "kalman_projected_delta_bps": kalman_features.get("kalman_projected_delta_bps", ""),
+            "kalman_residual_bps": kalman_features.get("kalman_residual_bps", ""),
+            "kalman_abs_residual_bps": kalman_features.get("kalman_abs_residual_bps", ""),
+            "kalman_uncertainty_bps": kalman_features.get("kalman_uncertainty_bps", ""),
+            "kalman_trend_agreement": kalman_features.get("kalman_trend_agreement", ""),
+        }
+        entry = {
+            "entry_id": entry_id,
+            "direction": decision.side,
+            "target_token_id": token_id,
+            "entry_price": round(price, 6),
+            "entry_shares": shares,
+            "stake_usd": stake,
+            "entry_fee_usd": fee,
+            "elapsed_s": round(float(elapsed), 3),
+            "opened_at": now_iso,
+            "fair_probability": row["fair_probability"],
+            "cheap_model_probability": row["cheap_model_probability"],
+            "cheap_raw_probability": row["cheap_raw_probability"],
+            "cheap_model_enabled": row["cheap_model_enabled"],
+            "cheap_model_version": row["cheap_model_version"],
+            "edge_probability": row["edge_probability"],
+            "ev_per_usd": row["ev_per_usd"],
+            "trigger_reason": decision.reason,
+            "delta_bps": row["delta_bps"],
+            "price_source": row["price_source"],
+        }
+        probe_state.setdefault("windows", {}).setdefault(slug, []).append(entry)
+        self._record_fair_value_giro_probe_entry(row)
+        self.log(
+            f"[GiroProbe] PAPER ENTRY | slug={slug} | #{len(probe_state['windows'][slug])} | "
+            f"direction={decision.side} | px={price:.4f} | p={float(decision.fair_probability):.3f} | "
+            f"edge={float(decision.edge_probability) * 100:.2f}pp | ev=${float(decision.ev_per_usd):.4f}/$ | "
+            f"model={'cheap' if getattr(decision, 'cheap_reversal_model_enabled', False) else 'fallback'} | "
+            f"elapsed={float(elapsed):.2f}s"
+        )
+        return True
+
+    async def _settle_fair_value_giro_probe_windows(
+        self,
+        probe_state: Dict,
+        now_ts: float,
+    ) -> None:
+        import datetime
+
+        windows = probe_state.setdefault("windows", {})
+        attempts = probe_state.setdefault("settlement_attempts", {})
+        for slug, entries in list(windows.items()):
+            if not entries:
+                windows.pop(slug, None)
+                attempts.pop(slug, None)
+                continue
+            start_time = self._start_time_from_btc_slug(slug)
+            if not start_time:
+                windows.pop(slug, None)
+                attempts.pop(slug, None)
+                continue
+            end_ts = start_time.timestamp() + 300.0
+            if now_ts < end_ts:
+                continue
+            last_attempt = float(attempts.get(slug, 0.0) or 0.0)
+            if now_ts - last_attempt < 5.0:
+                continue
+            attempts[slug] = now_ts
+
+            yes_won = None
+            opening_price = None
+            closing_price = None
+            detail = {}
+            official_entry = next(
+                (
+                    entry for entry in entries
+                    if entry.get("target_token_id") and entry.get("direction") in ("Yes", "No")
+                ),
+                None,
+            )
+            if official_entry:
+                token_won, _settlement_price = await self._infer_settlement_result(
+                    slug,
+                    str(official_entry.get("target_token_id")),
+                )
+                if token_won is not None:
+                    direction = official_entry.get("direction")
+                    yes_won = bool(token_won) if direction == "Yes" else not bool(token_won)
+                    detail = {"source": "official_outcome", "price_delta": ""}
+
+            if yes_won is None:
+                yes_won, opening_price, closing_price = await self._infer_chainlink_window_result(
+                    slug,
+                    "Yes",
+                    wait_seconds=1.0,
+                )
+                detail = getattr(self, "_last_chainlink_settlement_detail", {}) or {}
+                if yes_won is None:
+                    continue
+
+            if opening_price is not None and closing_price is not None:
+                detail = {
+                    **detail,
+                    "price_delta": float(closing_price) - float(opening_price),
+                }
+
+            total_pnl = 0.0
+            wins = 0
+            losses = 0
+            for entry in entries:
+                direction = entry.get("direction")
+                if direction not in ("Yes", "No"):
+                    continue
+                is_win = bool(yes_won) if direction == "Yes" else not bool(yes_won)
+                shares = float(entry.get("entry_shares", 0.0) or 0.0)
+                stake = float(entry.get("stake_usd", 0.0) or 0.0)
+                fee = float(entry.get("entry_fee_usd", 0.0) or 0.0)
+                payout = round(shares * (1.0 if is_win else 0.0), 4)
+                pnl = round(payout - stake - fee, 4)
+                total_pnl += pnl
+                wins += 1 if is_win else 0
+                losses += 0 if is_win else 1
+                self._record_fair_value_giro_probe_outcome({
+                    "event_ts_utc": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+                    "slug": slug,
+                    "entry_id": entry.get("entry_id", ""),
+                    "tactic": "giro_probe",
+                    "dry_run": self.dry_run,
+                    "direction": direction,
+                    "route": "paper_taker",
+                    "result": "WIN" if is_win else "LOSS",
+                    "stake_usd": round(stake, 4),
+                    "entry_price": round(float(entry.get("entry_price", 0.0) or 0.0), 6),
+                    "shares": round(shares, 4),
+                    "fee_usd": round(fee, 4),
+                    "payout_usd": payout,
+                    "pnl_usd": pnl,
+                    "fair_probability": entry.get("fair_probability", ""),
+                    "cheap_model_probability": entry.get("cheap_model_probability", ""),
+                    "cheap_raw_probability": entry.get("cheap_raw_probability", ""),
+                    "cheap_model_enabled": entry.get("cheap_model_enabled", ""),
+                    "cheap_model_version": entry.get("cheap_model_version", ""),
+                    "edge_probability": entry.get("edge_probability", ""),
+                    "ev_per_usd": entry.get("ev_per_usd", ""),
+                    "trigger_reason": entry.get("trigger_reason", ""),
+                    "delta_bps": entry.get("delta_bps", ""),
+                    "opening_price": round(float(opening_price), 8) if opening_price else "",
+                    "closing_price": round(float(closing_price), 8) if closing_price else "",
+                    "price_delta": detail.get("price_delta", ""),
+                    "settlement_source": detail.get("source", ""),
+                })
+            self.log(
+                f"[GiroProbe] Window settled for {slug}. entries={len(entries)} | "
+                f"W/L={wins}/{losses} | PnL=${total_pnl:.2f} | source={detail.get('source', '')}"
+            )
+            windows.pop(slug, None)
+            attempts.pop(slug, None)
+
+    def _fair_value_ladder_allows(self, state: Dict, decision, tactic: str) -> bool:
+        if not decision or not decision.should_enter:
+            return False
+        entries = self._fair_value_entries(state)
+        if not entries:
+            return True
+        best_ev = max(float(entry.get("ev_per_usd") or 0.0) for entry in entries)
+        if tactic == "momentum":
+            improvement = float(getattr(
+                self,
+                "fair_value_momentum_min_ev_improvement_per_entry",
+                0.04,
+            ))
+        elif tactic == "late_continuation":
+            improvement = float(getattr(
+                self,
+                "fair_value_late_continuation_min_ev_improvement_per_entry",
+                0.03,
+            ))
+        else:
+            improvement = float(getattr(
+                self,
+                "fair_value_min_ev_improvement_per_entry",
+                0.03,
+            ))
+        return float(decision.ev_per_usd or 0.0) >= best_ev + improvement
+
+    def _fair_value_select_decision(
+        self,
+        elapsed: float,
+        core_decision,
+        momentum_decision,
+        late_continuation_decision=None,
+        state: Optional[Dict] = None,
+    ) -> Tuple[object, str]:
+        choices = []
+        state = state or {}
+        core_count = self._fair_value_tactic_count(state, "core_edge")
+        momentum_count = self._fair_value_tactic_count(state, "momentum")
+        late_count = self._fair_value_tactic_count(state, "late_continuation")
+        core_limit = int(getattr(self, "fair_value_core_max_entries_per_window", 2) or 0)
+        momentum_limit = int(getattr(self, "fair_value_momentum_max_entries_per_window", 2) or 0)
+        late_limit = int(getattr(self, "fair_value_late_continuation_max_entries_per_window", 2) or 0)
+        core_start = float(getattr(self, "fair_value_entry_start_seconds", 0.0))
+        core_end = float(getattr(self, "fair_value_entry_end_seconds", 240.0))
+        if (
+            bool(getattr(self, "fair_value_core_enabled", True))
+            and
+            core_start <= elapsed <= core_end
+            and core_decision
+            and core_decision.should_enter
+            and (core_limit <= 0 or core_count < core_limit)
+            and self._fair_value_ladder_allows(state, core_decision, "core_edge")
+        ):
+            choices.append(("core_edge", core_decision))
+
+        if bool(getattr(self, "fair_value_momentum_enabled", True)):
+            momentum_start = float(getattr(self, "fair_value_momentum_start_seconds", 240.0))
+            momentum_end = float(getattr(self, "fair_value_momentum_end_seconds", 300.0))
+            if (
+                momentum_start <= elapsed <= momentum_end
+                and momentum_decision
+                and momentum_decision.should_enter
+                and (momentum_limit <= 0 or momentum_count < momentum_limit)
+                and self._fair_value_ladder_allows(state, momentum_decision, "momentum")
+            ):
+                choices.append(("momentum", momentum_decision))
+
+        if bool(getattr(self, "fair_value_late_continuation_enabled", True)):
+            late_start = float(getattr(self, "fair_value_late_continuation_start_seconds", 250.0))
+            late_end = float(getattr(self, "fair_value_late_continuation_end_seconds", 300.0))
+            if (
+                late_start <= elapsed <= late_end
+                and late_continuation_decision
+                and late_continuation_decision.should_enter
+                and (late_limit <= 0 or late_count < late_limit)
+                and self._fair_value_ladder_allows(state, late_continuation_decision, "late_continuation")
+            ):
+                choices.append(("late_continuation", late_continuation_decision))
+
+        if not choices:
+            return FairValueDecision(should_enter=False), ""
+        tactic, decision = max(choices, key=lambda item: float(item[1].ev_per_usd or 0.0))
+        return decision, tactic
+
+    def _fair_value_tactic_count(self, state: Dict, tactic: str) -> int:
+        return sum(
+            1
+            for entry in self._fair_value_entries(state)
+            if (entry.get("tactic") or "core_edge") == tactic
+        )
+
+    def _fair_value_is_transient_order_error(self, error_text: str) -> bool:
+        text = str(error_text or "").lower()
+        return any(
+            marker in text
+            for marker in (
+                "request exception",
+                "connecterror",
+                "connection",
+                "timed out",
+                "timeout",
+                "winerror 10054",
+                "clob connectivity",
+            )
+        )
+
+    def _fair_value_order_error_cooldown_seconds(self, error_text: str) -> float:
+        text = str(error_text or "").lower()
+        if self._fair_value_is_transient_order_error(error_text):
+            return 1.0
+        if "service not ready" in text or "order timed out" in text:
+            return 1.0
+        if any(marker in text for marker in ("invalid signature", "insufficient", "invalid amount")):
+            return 30.0
+        return 1.0
+
+    def _fair_value_register_order_error(self, state: Dict, slug: str, error_text: str) -> None:
+        errors = int(state.get("consecutive_order_errors", 0) or 0) + 1
+        state["consecutive_order_errors"] = errors
+        base = self._fair_value_order_error_cooldown_seconds(error_text)
+        if base <= 2.0:
+            cooldown = base
+        else:
+            cooldown = min(base * max(errors, 1), 180.0)
+        until = time.time() + cooldown
+        state["order_error_cooldown_until"] = until
+        if not self._fair_value_is_transient_order_error(error_text):
+            state["maker_attempted_slug"] = slug
+        self.log(
+            f"[FairValue] Order retry delay {cooldown:.0f}s after {errors} consecutive rejection(s). "
+            f"Reason: {str(error_text)[:180]}"
+        )
+
+    def _fair_value_clear_order_errors(self, state: Dict) -> None:
+        state["consecutive_order_errors"] = 0
+        state["order_error_cooldown_until"] = 0.0
+
+    def _fair_value_latest_entry_end(self) -> float:
+        ends = [float(getattr(self, "fair_value_entry_end_seconds", 240.0))]
+        if bool(getattr(self, "fair_value_momentum_enabled", True)):
+            ends.append(float(getattr(self, "fair_value_momentum_end_seconds", 300.0)))
+        if bool(getattr(self, "fair_value_late_continuation_enabled", True)):
+            ends.append(float(getattr(self, "fair_value_late_continuation_end_seconds", 300.0)))
+        return max(ends)
+
+    def _fair_value_apply_entry(
+        self,
+        state: Dict,
+        slug: str,
+        direction: str,
+        token_id: str,
+        route: str,
+        price: float,
+        stake_usd: float,
+        fair_probability: float,
+        edge_probability: float,
+        ev_per_usd: float,
+        elapsed: float,
+        order_text: str = "",
+        filled_usd: Optional[float] = None,
+        filled_shares: Optional[float] = None,
+        tactic: str = "core_edge",
+        entry_model_win_probability: float = 0.0,
+        entry_model_min_probability: float = 0.0,
+        break_even_price: float = 0.0,
+        max_acceptable_price: float = 0.0,
+        price_margin: float = 0.0,
+        continuation_probability: float = 0.0,
+        abs_delta_bps: float = 0.0,
+    ):
+        import datetime
+
+        stake = round(float(filled_usd if filled_usd is not None else stake_usd), 4)
+        p = max(float(price), 0.01)
+        shares = round(
+            float(filled_shares) if filled_shares is not None else stake / p,
+            4,
+        )
+        fee = 0.0 if str(route).startswith("maker") else taker_fee_for_stake(
+            stake,
+            p,
+            float(getattr(self, "martingale_taker_fee_rate", 0.07)),
+        )
+        shadow = self._fair_value_shadow_dynamic_stake(
+            tactic=tactic or "core_edge",
+            base_stake_usd=stake,
+            edge_probability=edge_probability,
+            ev_per_usd=ev_per_usd,
+            entry_model_win_probability=entry_model_win_probability,
+            price_margin=price_margin,
+            continuation_probability=continuation_probability,
+        )
+        kalman_features = ((state.get("kalman") or {}).get("features") or {})
+        now_iso = datetime.datetime.now(datetime.timezone.utc).isoformat()
+        entries = self._fair_value_entries(state)
+        entry_id = int(state.get("next_entry_id", 1) or 1)
+        entry_number = len(entries) + 1
+        entry = {
+            "entry_id": entry_id,
+            "entry_number_in_window": entry_number,
+            "tactic": tactic or "core_edge",
+            "slug": slug,
+            "direction": direction,
+            "target_token_id": token_id,
+            "entry_price": round(p, 6),
+            "entry_shares": shares,
+            "stake_usd": stake,
+            "entry_fee_usd": fee,
+            "entry_route": route,
+            "shadow_dynamic_stake_enabled": shadow["shadow_dynamic_stake_enabled"],
+            "shadow_stake_usd": shadow["shadow_stake_usd"],
+            "shadow_stake_multiplier": shadow["shadow_stake_multiplier"],
+            "shadow_stake_reason": shadow["shadow_stake_reason"],
+            "fair_probability": round(float(fair_probability), 6),
+            "edge_probability": round(float(edge_probability), 6),
+            "ev_per_usd": round(float(ev_per_usd), 6),
+            "entry_model_win_probability": round(float(entry_model_win_probability or 0.0), 6),
+            "entry_model_min_probability": round(float(entry_model_min_probability or 0.0), 6),
+            "break_even_price": round(float(break_even_price or 0.0), 6),
+            "max_acceptable_price": round(float(max_acceptable_price or 0.0), 6),
+            "price_margin": round(float(price_margin or 0.0), 6),
+            "continuation_probability": round(float(continuation_probability or 0.0), 6),
+            "abs_delta_bps": round(float(abs_delta_bps or 0.0), 6),
+            "kalman_delta_bps": round(float(kalman_features.get("kalman_delta_bps", 0.0) or 0.0), 6),
+            "kalman_velocity_bps_per_min": round(float(kalman_features.get("kalman_velocity_bps_per_min", 0.0) or 0.0), 6),
+            "kalman_projected_delta_bps": round(float(kalman_features.get("kalman_projected_delta_bps", 0.0) or 0.0), 6),
+            "kalman_residual_bps": round(float(kalman_features.get("kalman_residual_bps", 0.0) or 0.0), 6),
+            "kalman_abs_residual_bps": round(float(kalman_features.get("kalman_abs_residual_bps", 0.0) or 0.0), 6),
+            "kalman_uncertainty_bps": round(float(kalman_features.get("kalman_uncertainty_bps", 0.0) or 0.0), 6),
+            "kalman_trend_agreement": round(float(kalman_features.get("kalman_trend_agreement", 0.0) or 0.0), 6),
+            "opened_at": now_iso,
+            "elapsed_s": round(float(elapsed), 3),
+        }
+        entries.append(entry)
+        state["entries"] = entries
+        state["next_entry_id"] = entry_id + 1
+        state.update({
+            "active_slug": slug,
+            "entry_done": True,
+            "direction": direction,
+            "target_token_id": token_id,
+            "entry_price": round(p, 6),
+            "entry_shares": shares,
+            "stake_usd": stake,
+            "entry_fee_usd": fee,
+            "entry_route": route,
+            "shadow_dynamic_stake_enabled": shadow["shadow_dynamic_stake_enabled"],
+            "shadow_stake_usd": shadow["shadow_stake_usd"],
+            "shadow_stake_multiplier": shadow["shadow_stake_multiplier"],
+            "shadow_stake_reason": shadow["shadow_stake_reason"],
+            "fair_probability": round(float(fair_probability), 6),
+            "edge_probability": round(float(edge_probability), 6),
+            "ev_per_usd": round(float(ev_per_usd), 6),
+            "entry_model_win_probability": round(float(entry_model_win_probability or 0.0), 6),
+            "entry_model_min_probability": round(float(entry_model_min_probability or 0.0), 6),
+            "break_even_price": round(float(break_even_price or 0.0), 6),
+            "max_acceptable_price": round(float(max_acceptable_price or 0.0), 6),
+            "price_margin": round(float(price_margin or 0.0), 6),
+            "continuation_probability": round(float(continuation_probability or 0.0), 6),
+            "abs_delta_bps": round(float(abs_delta_bps or 0.0), 6),
+            "kalman_delta_bps": round(float(kalman_features.get("kalman_delta_bps", 0.0) or 0.0), 6),
+            "kalman_velocity_bps_per_min": round(float(kalman_features.get("kalman_velocity_bps_per_min", 0.0) or 0.0), 6),
+            "kalman_projected_delta_bps": round(float(kalman_features.get("kalman_projected_delta_bps", 0.0) or 0.0), 6),
+            "kalman_residual_bps": round(float(kalman_features.get("kalman_residual_bps", 0.0) or 0.0), 6),
+            "kalman_abs_residual_bps": round(float(kalman_features.get("kalman_abs_residual_bps", 0.0) or 0.0), 6),
+            "kalman_uncertainty_bps": round(float(kalman_features.get("kalman_uncertainty_bps", 0.0) or 0.0), 6),
+            "kalman_trend_agreement": round(float(kalman_features.get("kalman_trend_agreement", 0.0) or 0.0), 6),
+            "opened_at": now_iso,
+            "tactic": tactic or "core_edge",
+            "elapsed_s": round(float(elapsed), 3),
+            "maker_candidate": None,
+            "consecutive_order_errors": 0,
+            "order_error_cooldown_until": 0.0,
+        })
+        self._record_fair_value_entry({
+            "event_ts_utc": now_iso,
+            "slug": slug,
+            "entry_id": entry_id,
+            "entry_number_in_window": entry_number,
+            "tactic": tactic or "core_edge",
+            "dry_run": self.dry_run,
+            "live_trading_enabled": bool(getattr(self, "fair_value_live_trading_enabled", False)),
+            "direction": direction,
+            "route": route,
+            "elapsed_s": round(float(elapsed), 3),
+            "price": round(p, 6),
+            "stake_usd": stake,
+            "shares": shares,
+            "fee_usd": fee,
+            "shadow_dynamic_stake_enabled": shadow["shadow_dynamic_stake_enabled"],
+            "shadow_stake_usd": shadow["shadow_stake_usd"],
+            "shadow_stake_multiplier": shadow["shadow_stake_multiplier"],
+            "shadow_stake_reason": shadow["shadow_stake_reason"],
+            "fair_probability": round(float(fair_probability), 6),
+            "edge_probability": round(float(edge_probability), 6),
+            "ev_per_usd": round(float(ev_per_usd), 6),
+            "entry_model_win_probability": round(float(entry_model_win_probability or 0.0), 6),
+            "entry_model_min_probability": round(float(entry_model_min_probability or 0.0), 6),
+            "break_even_price": round(float(break_even_price or 0.0), 6),
+            "max_acceptable_price": round(float(max_acceptable_price or 0.0), 6),
+            "price_margin": round(float(price_margin or 0.0), 6),
+            "continuation_probability": round(float(continuation_probability or 0.0), 6),
+            "abs_delta_bps": round(float(abs_delta_bps or 0.0), 6),
+            "kalman_delta_bps": round(float(kalman_features.get("kalman_delta_bps", 0.0) or 0.0), 6),
+            "kalman_velocity_bps_per_min": round(float(kalman_features.get("kalman_velocity_bps_per_min", 0.0) or 0.0), 6),
+            "kalman_projected_delta_bps": round(float(kalman_features.get("kalman_projected_delta_bps", 0.0) or 0.0), 6),
+            "kalman_residual_bps": round(float(kalman_features.get("kalman_residual_bps", 0.0) or 0.0), 6),
+            "kalman_abs_residual_bps": round(float(kalman_features.get("kalman_abs_residual_bps", 0.0) or 0.0), 6),
+            "kalman_uncertainty_bps": round(float(kalman_features.get("kalman_uncertainty_bps", 0.0) or 0.0), 6),
+            "kalman_trend_agreement": round(float(kalman_features.get("kalman_trend_agreement", 0.0) or 0.0), 6),
+            "order_text": order_text[:240],
+        })
+        max_price_text = (
+            f"max_px={float(max_acceptable_price):.4f} | "
+            if float(max_acceptable_price or 0.0) > 0.0
+            else ""
+        )
+        self.log(
+            f"[FairValue] ENTRY | slug={slug} | #{entry_number} | tactic={tactic or 'core_edge'} | "
+            f"direction={direction} | route={route} | "
+            f"usd=${stake:.2f} | px={p:.4f} | fair={float(fair_probability):.3f} | "
+            f"edge={float(edge_probability) * 100:.2f}pp | ev=${float(ev_per_usd):.4f}/$ | "
+            f"{max_price_text}"
+            f"model_p={float(entry_model_win_probability or 0.0):.3f} | "
+            f"shadow=${float(shadow['shadow_stake_usd']):.2f}x{float(shadow['shadow_stake_multiplier']):.2f} | "
+            f"fee~=${fee:.2f} | elapsed={float(elapsed):.2f}s"
+        )
+
+    async def _fair_value_try_live_entry(
+        self,
+        session: ClientSession,
+        slug: str,
+        token_id: str,
+        direction: str,
+        route: str,
+        price: float,
+        stake_usd: float,
+        fair_probability: float = 0.0,
+        edge_probability: float = 0.0,
+        ev_per_usd: float = 0.0,
+        tactic: str = "core_edge",
+        elapsed: float = 0.0,
+    ) -> Tuple[bool, str, Optional[float], Optional[float], Optional[float], str]:
+        if self.dry_run or not bool(getattr(self, "fair_value_live_trading_enabled", False)):
+            return True, "paper", None, None, None, route
+        if session is None:
+            return False, "no MCP session", None, None, None, route
+        if route == "maker":
+            maker_shares = self._shares_for_limit_minimum(
+                float(stake_usd) / max(float(price), 0.01),
+                float(price),
+            )
+            min_limit_shares = float(getattr(self, "polymarket_min_limit_order_shares", 5.0) or 5.0)
+            if maker_shares < min_limit_shares:
+                return (
+                    False,
+                    f"maker size {maker_shares:.2f} below min {min_limit_shares:.2f}",
+                    None,
+                    None,
+                    None,
+                    route,
+                )
+
+            wait_seconds = max(float(getattr(self, "fair_value_maker_wait_seconds", 3.0)), 0.0)
+            sample_seconds = min(
+                max(float(getattr(self, "fair_value_sample_seconds", 1.0)), 0.1),
+                0.5,
+            )
+            self._record_fair_value_maker_event({
+                "event_ts_utc": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+                "slug": slug,
+                "dry_run": self.dry_run,
+                "event": "created_live",
+                "tactic": tactic or "core_edge",
+                "direction": direction,
+                "maker_price": round(float(price), 6),
+                "best_ask": "",
+                "elapsed_s": round(float(elapsed), 3),
+                "stake_usd": round(float(stake_usd), 4),
+                "fair_probability": round(float(fair_probability), 6),
+                "edge_probability": round(float(edge_probability), 6),
+                "ev_per_usd": round(float(ev_per_usd), 6),
+            })
+            self.log(
+                f"[FairValue] Live maker order | slug={slug} | direction={direction} | "
+                f"maker_px={float(price):.4f} | usd=${float(stake_usd):.2f} | "
+                f"shares={maker_shares:.2f} | wait={wait_seconds:.1f}s"
+            )
+            order_res = await session.call_tool("place_order", arguments={
+                "market_slug": slug,
+                "side": "BUY",
+                "size": maker_shares,
+                "price": round(float(price), 4),
+                "token_id": token_id,
+                "order_type": "GTC",
+                "post_only": True,
+                "defer_exec": False,
+            })
+            order_text = order_res.content[0].text if order_res and order_res.content else ""
+            order_ok, order_error, order_data = self._parse_order_response(order_text, allow_live=True)
+            if not order_ok:
+                return False, order_error[:240], None, None, None, route
+
+            order_id = self._extract_order_id(order_data)
+            if not order_id:
+                return False, "maker order response had no order_id", None, None, None, route
+
+            filled_usd, filled_shares, avg_entry_price, status = self._maker_fill_from_order_data(
+                order_data,
+                requested_shares=maker_shares,
+                maker_price=float(price),
+            )
+            deadline = time.time() + wait_seconds
+            while filled_shares < maker_shares * 0.98 and status not in ("filled", "matched"):
+                now = time.time()
+                if now >= deadline:
+                    break
+                await asyncio.sleep(min(sample_seconds, max(deadline - now, 0.0)))
+                check_res = await session.call_tool("get_order", arguments={"order_id": order_id})
+                check_text = check_res.content[0].text if check_res and check_res.content else ""
+                check_ok, check_error, check_data = self._parse_order_response(check_text, allow_live=True)
+                if not check_ok:
+                    self.log(f"[FairValue] Live maker status check failed: {check_error[:180]}")
+                    continue
+                filled_usd, filled_shares, avg_entry_price, status = self._maker_fill_from_order_data(
+                    check_data,
+                    requested_shares=maker_shares,
+                    maker_price=float(price),
+                )
+
+            if filled_shares < maker_shares * 0.98:
+                cancel_res = await session.call_tool("cancel_order", arguments={"order_id": order_id})
+                cancel_text = cancel_res.content[0].text if cancel_res and cancel_res.content else ""
+                cancel_ok, cancel_error, cancel_data = self._parse_order_response(cancel_text, allow_live=True)
+                not_canceled = (
+                    cancel_data.get("not_canceled")
+                    or cancel_data.get("notCanceled")
+                    if isinstance(cancel_data, dict)
+                    else None
+                )
+                if not_canceled:
+                    cancel_ok = False
+                    cancel_error = f"not_canceled={not_canceled}"
+                if cancel_ok:
+                    self.log(f"[FairValue] Cancelled unfilled maker remainder for order {order_id[:10]}...")
+                else:
+                    self.log(f"[FairValue] Maker cancel warning: {cancel_error[:180]}")
+
+            if filled_shares <= 0:
+                self._record_fair_value_maker_event({
+                    "event_ts_utc": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+                    "slug": slug,
+                    "dry_run": self.dry_run,
+                    "event": "expired_live",
+                    "tactic": tactic or "core_edge",
+                    "direction": direction,
+                    "maker_price": round(float(price), 6),
+                    "best_ask": "",
+                    "elapsed_s": round(float(elapsed), 3),
+                    "stake_usd": round(float(stake_usd), 4),
+                    "fair_probability": round(float(fair_probability), 6),
+                    "edge_probability": round(float(edge_probability), 6),
+                    "ev_per_usd": round(float(ev_per_usd), 6),
+                })
+                return False, "maker order not filled", None, None, None, route
+
+            filled_usd = round(
+                filled_usd if filled_usd > 0 else filled_shares * float(price),
+                4,
+            )
+            complete = filled_shares >= maker_shares * 0.98
+            route_label = "maker_live" if complete else "maker_partial"
+            self._record_fair_value_maker_event({
+                "event_ts_utc": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+                "slug": slug,
+                "dry_run": self.dry_run,
+                "event": "filled_live" if complete else "partial_live",
+                "tactic": tactic or "core_edge",
+                "direction": direction,
+                "maker_price": round(float(price), 6),
+                "best_ask": "",
+                "elapsed_s": round(float(elapsed), 3),
+                "stake_usd": round(float(filled_usd), 4),
+                "fair_probability": round(float(fair_probability), 6),
+                "edge_probability": round(float(edge_probability), 6),
+                "ev_per_usd": round(float(ev_per_usd), 6),
+            })
+            self.log(
+                f"[FairValue] Maker fill | route={route_label} | usd=${filled_usd:.2f} | "
+                f"px={avg_entry_price:.4f} | shares={filled_shares:.4f} | status={status or 'unknown'}"
+            )
+            return True, order_text[:240], filled_usd, filled_shares, avg_entry_price, route_label
+
+        order_type = str(getattr(self, "fair_value_order_type", "FOK") or "FOK").upper()
+        if order_type not in ("FAK", "FOK"):
+            order_type = "FOK"
+        order_res = await session.call_tool("place_market_order", arguments={
+            "market_slug": slug,
+            "side": "BUY",
+            "amount": round(max(float(stake_usd), self.polymarket_min_market_buy_usd), 2),
+            "token_id": token_id,
+            "order_type": order_type,
+            "defer_exec": False,
+        })
+        order_text = order_res.content[0].text if order_res and order_res.content else ""
+        order_ok, order_error, order_data = self._parse_order_response(order_text, allow_live=False)
+        if not order_ok:
+            return False, order_error[:240], None, None, None, route
+        filled_usd, filled_shares, avg_entry_price = self._order_fill_from_response(
+            order_data,
+            fallback_usd=stake_usd,
+            fallback_price=price,
+        )
+        return True, order_text[:240], filled_usd, filled_shares, avg_entry_price, route
+
+    async def _fair_value_handle_maker_candidate(
+        self,
+        session: ClientSession,
+        state: Dict,
+        slug: str,
+        elapsed: float,
+        context: Dict,
+    ) -> bool:
+        candidate = state.get("maker_candidate")
+        if not isinstance(candidate, dict) or candidate.get("slug") != slug:
+            return False
+        if not self.dry_run and bool(getattr(self, "fair_value_live_trading_enabled", False)):
+            self.log("[FairValue] Clearing stale paper maker candidate before live trading.")
+            state["maker_candidate"] = None
+            self.save_state()
+            return False
+
+        side = candidate.get("direction")
+        metrics = context["yes_metrics"] if side == "Yes" else context["no_metrics"]
+        best_ask = float(metrics.get("best_ask") or 0.0)
+        maker_price = float(candidate.get("maker_price") or 0.0)
+        now_ts = time.time()
+        if best_ask > 0 and best_ask <= maker_price:
+            token_id = context["token_ids"][0 if side == "Yes" else 1]
+            route = (
+                "maker_simulated"
+                if self.dry_run or not bool(getattr(self, "fair_value_live_trading_enabled", False))
+                else "maker_live"
+            )
+            self._record_fair_value_maker_event({
+                "event_ts_utc": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+                "slug": slug,
+                "dry_run": self.dry_run,
+                "event": "filled_simulated" if route == "maker_simulated" else "filled_live",
+                "tactic": candidate.get("tactic", "core_edge") or "core_edge",
+                "direction": side,
+                "maker_price": round(maker_price, 6),
+                "best_ask": round(best_ask, 6),
+                "elapsed_s": round(float(elapsed), 3),
+                "stake_usd": round(float(candidate.get("stake_usd") or 0.0), 4),
+                "fair_probability": round(float(candidate.get("fair_probability") or 0.0), 6),
+                "edge_probability": round(float(candidate.get("edge_probability") or 0.0), 6),
+                "ev_per_usd": round(float(candidate.get("ev_per_usd") or 0.0), 6),
+                "entry_model_win_probability": round(float(candidate.get("entry_model_win_probability") or 0.0), 6),
+                "entry_model_min_probability": round(float(candidate.get("entry_model_min_probability") or 0.0), 6),
+                "break_even_price": round(float(candidate.get("break_even_price") or 0.0), 6),
+                "max_acceptable_price": round(float(candidate.get("max_acceptable_price") or 0.0), 6),
+                "price_margin": round(float(candidate.get("price_margin") or 0.0), 6),
+                "continuation_probability": round(float(candidate.get("continuation_probability") or 0.0), 6),
+                "abs_delta_bps": round(float(candidate.get("abs_delta_bps") or 0.0), 6),
+            })
+            self._fair_value_apply_entry(
+                state=state,
+                slug=slug,
+                direction=side,
+                token_id=token_id,
+                route=route,
+                price=maker_price,
+                stake_usd=float(candidate.get("stake_usd") or getattr(self, "fair_value_stake_usd", 1.0)),
+                fair_probability=float(candidate.get("fair_probability") or 0.0),
+                edge_probability=float(candidate.get("edge_probability") or 0.0),
+                ev_per_usd=float(candidate.get("ev_per_usd") or 0.0),
+                elapsed=elapsed,
+                tactic=candidate.get("tactic", "core_edge") or "core_edge",
+                entry_model_win_probability=float(candidate.get("entry_model_win_probability") or 0.0),
+                entry_model_min_probability=float(candidate.get("entry_model_min_probability") or 0.0),
+                break_even_price=float(candidate.get("break_even_price") or 0.0),
+                max_acceptable_price=float(candidate.get("max_acceptable_price") or 0.0),
+                price_margin=float(candidate.get("price_margin") or 0.0),
+                continuation_probability=float(candidate.get("continuation_probability") or 0.0),
+                abs_delta_bps=float(candidate.get("abs_delta_bps") or 0.0),
+            )
+            return True
+
+        if now_ts >= float(candidate.get("deadline_ts") or 0.0):
+            self._record_fair_value_maker_event({
+                "event_ts_utc": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+                "slug": slug,
+                "dry_run": self.dry_run,
+                "event": "expired",
+                "tactic": candidate.get("tactic", "core_edge") or "core_edge",
+                "direction": side,
+                "maker_price": round(maker_price, 6),
+                "best_ask": round(best_ask, 6),
+                "elapsed_s": round(float(elapsed), 3),
+                "stake_usd": round(float(candidate.get("stake_usd") or 0.0), 4),
+                "fair_probability": round(float(candidate.get("fair_probability") or 0.0), 6),
+                "edge_probability": round(float(candidate.get("edge_probability") or 0.0), 6),
+                "ev_per_usd": round(float(candidate.get("ev_per_usd") or 0.0), 6),
+                "entry_model_win_probability": round(float(candidate.get("entry_model_win_probability") or 0.0), 6),
+                "entry_model_min_probability": round(float(candidate.get("entry_model_min_probability") or 0.0), 6),
+                "break_even_price": round(float(candidate.get("break_even_price") or 0.0), 6),
+                "max_acceptable_price": round(float(candidate.get("max_acceptable_price") or 0.0), 6),
+                "price_margin": round(float(candidate.get("price_margin") or 0.0), 6),
+                "continuation_probability": round(float(candidate.get("continuation_probability") or 0.0), 6),
+                "abs_delta_bps": round(float(candidate.get("abs_delta_bps") or 0.0), 6),
+            })
+            self.log(
+                f"[FairValue] Maker candidate expired | slug={slug} | direction={side} | "
+                f"maker_px={maker_price:.4f} | best_ask={best_ask:.4f}. Taker can still enter if edge remains."
+            )
+            state["maker_candidate"] = None
+            state["maker_attempted_slug"] = slug
+            self.save_state()
+        else:
+            return True
+        return False
+
+    async def _settle_active_fair_value_trade(self, state: Dict, slug: str, now_ts: float) -> bool:
+        import datetime
+
+        entries = list(self._fair_value_entries(state))
+        if not entries:
+            return False
+
+        start_time = self._start_time_from_btc_slug(slug)
+        if not start_time:
+            return False
+
+        yes_won = None
+        opening_price = None
+        closing_price = None
+        detail = {}
+
+        official_entry = next(
+            (
+                entry for entry in entries
+                if entry.get("target_token_id") and entry.get("direction") in ("Yes", "No")
+            ),
+            None,
+        )
+        if official_entry:
+            token_won, _settlement_price = await self._infer_settlement_result(
+                slug,
+                str(official_entry.get("target_token_id")),
+            )
+            if token_won is not None:
+                entry_direction = official_entry.get("direction")
+                yes_won = bool(token_won) if entry_direction == "Yes" else not bool(token_won)
+                detail = {
+                    "source": "official_outcome",
+                    "price_delta": "",
+                }
+
+        if yes_won is None:
+            yes_won, opening_price, closing_price = await self._infer_chainlink_window_result(
+                slug,
+                "Yes",
+                wait_seconds=2.5,
+            )
+            detail = getattr(self, "_last_chainlink_settlement_detail", {}) or {}
+            if yes_won is None:
+                last_log = float(state.get("last_settlement_wait_log_at", 0.0) or 0.0)
+                if time.time() - last_log >= 30.0:
+                    self.log(
+                        f"[FairValue] Waiting for official/Chainlink settlement for {slug}. "
+                        "Holding entries unresolved."
+                    )
+                    state["last_settlement_wait_log_at"] = time.time()
+                    self.save_state()
+                return False
+
+        if opening_price is not None and closing_price is not None:
+            delta = float(closing_price) - float(opening_price)
+            detail = {
+                **detail,
+                "price_delta": delta,
+            }
+
+        total_pnl = 0.0
+        wins = 0
+        losses = 0
+        decision_latency = round(max(time.time() - now_ts, 0.0), 4)
+        for entry in entries:
+            direction = entry.get("direction")
+            if direction not in ("Yes", "No"):
+                continue
+            is_win = bool(yes_won) if direction == "Yes" else not bool(yes_won)
+            shares = float(entry.get("entry_shares", 0.0) or 0.0)
+            stake = float(entry.get("stake_usd", 0.0) or 0.0)
+            fee = float(entry.get("entry_fee_usd", 0.0) or 0.0)
+            payout = round(shares * (1.0 if is_win else 0.0), 4)
+            pnl = round(payout - stake - fee, 4)
+            entry_price = max(float(entry.get("entry_price", 0.0) or 0.0), 0.01)
+            shadow_stake = float(entry.get("shadow_stake_usd", stake) or stake)
+            shadow_shares = round(shadow_stake / entry_price, 4)
+            shadow_fee = 0.0 if str(entry.get("entry_route", "")).startswith("maker") else taker_fee_for_stake(
+                shadow_stake,
+                entry_price,
+                float(getattr(self, "martingale_taker_fee_rate", 0.07)),
+            )
+            shadow_payout = round(shadow_shares * (1.0 if is_win else 0.0), 4)
+            shadow_pnl = round(shadow_payout - shadow_stake - shadow_fee, 4)
+            total_pnl += pnl
+            if is_win:
+                wins += 1
+            else:
+                losses += 1
+            self._record_fair_value_outcome({
+                "event_ts_utc": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+                "slug": slug,
+                "entry_id": entry.get("entry_id", ""),
+                "entry_number_in_window": entry.get("entry_number_in_window", ""),
+                "tactic": entry.get("tactic", "core_edge"),
+                "dry_run": self.dry_run,
+                "direction": direction,
+                "route": entry.get("entry_route", ""),
+                "result": "WIN" if is_win else "LOSS",
+                "stake_usd": round(stake, 4),
+                "entry_price": round(entry_price, 6),
+                "shares": round(shares, 4),
+                "fee_usd": round(fee, 4),
+                "payout_usd": payout,
+                "pnl_usd": pnl,
+                "shadow_dynamic_stake_enabled": entry.get("shadow_dynamic_stake_enabled", False),
+                "shadow_stake_usd": round(shadow_stake, 4),
+                "shadow_stake_multiplier": entry.get("shadow_stake_multiplier", 1.0),
+                "shadow_stake_reason": entry.get("shadow_stake_reason", ""),
+                "shadow_shares": shadow_shares,
+                "shadow_fee_usd": round(shadow_fee, 4),
+                "shadow_payout_usd": shadow_payout,
+                "shadow_pnl_usd": shadow_pnl,
+                "fair_probability": entry.get("fair_probability", ""),
+                "edge_probability": entry.get("edge_probability", ""),
+                "ev_per_usd": entry.get("ev_per_usd", ""),
+                "entry_model_win_probability": entry.get("entry_model_win_probability", ""),
+                "entry_model_min_probability": entry.get("entry_model_min_probability", ""),
+                "break_even_price": entry.get("break_even_price", ""),
+                "max_acceptable_price": entry.get("max_acceptable_price", ""),
+                "price_margin": entry.get("price_margin", ""),
+                "continuation_probability": entry.get("continuation_probability", ""),
+                "abs_delta_bps": entry.get("abs_delta_bps", ""),
+                "opening_price": round(float(opening_price), 8) if opening_price else "",
+                "closing_price": round(float(closing_price), 8) if closing_price else "",
+                "price_delta": detail.get("price_delta", ""),
+                "settlement_source": detail.get("source", ""),
+                "decision_latency": decision_latency,
+            })
+        self.log(
+            f"[FairValue] Window settled for {slug}. entries={len(entries)} | "
+            f"W/L={wins}/{losses} | PnL=${total_pnl:.2f} | source={detail.get('source', '')}"
+        )
+        fresh = self._new_fair_value_state()
+        state.clear()
+        state.update(fresh)
+        self.save_state()
+        return True
+
+    def _release_unresolved_fair_value_state(self, state: Dict, slug: str, reason: str) -> None:
+        import datetime
+
+        entries = list(self._fair_value_entries(state))
+        now_iso = datetime.datetime.now(datetime.timezone.utc).isoformat()
+        for entry in entries:
+            self._record_fair_value_outcome({
+                "event_ts_utc": now_iso,
+                "slug": slug,
+                "entry_id": entry.get("entry_id", ""),
+                "entry_number_in_window": entry.get("entry_number_in_window", ""),
+                "tactic": entry.get("tactic", "core_edge"),
+                "dry_run": self.dry_run,
+                "direction": entry.get("direction", ""),
+                "route": entry.get("entry_route", ""),
+                "result": "UNRESOLVED",
+                "stake_usd": round(float(entry.get("stake_usd", 0.0) or 0.0), 4),
+                "entry_price": round(float(entry.get("entry_price", 0.0) or 0.0), 6),
+                "shares": round(float(entry.get("entry_shares", 0.0) or 0.0), 4),
+                "fee_usd": round(float(entry.get("entry_fee_usd", 0.0) or 0.0), 4),
+                "payout_usd": "",
+                "pnl_usd": "",
+                "shadow_dynamic_stake_enabled": entry.get("shadow_dynamic_stake_enabled", False),
+                "shadow_stake_usd": entry.get("shadow_stake_usd", ""),
+                "shadow_stake_multiplier": entry.get("shadow_stake_multiplier", ""),
+                "shadow_stake_reason": entry.get("shadow_stake_reason", ""),
+                "shadow_shares": "",
+                "shadow_fee_usd": "",
+                "shadow_payout_usd": "",
+                "shadow_pnl_usd": "",
+                "fair_probability": entry.get("fair_probability", ""),
+                "edge_probability": entry.get("edge_probability", ""),
+                "ev_per_usd": entry.get("ev_per_usd", ""),
+                "entry_model_win_probability": entry.get("entry_model_win_probability", ""),
+                "entry_model_min_probability": entry.get("entry_model_min_probability", ""),
+                "break_even_price": entry.get("break_even_price", ""),
+                "max_acceptable_price": entry.get("max_acceptable_price", ""),
+                "price_margin": entry.get("price_margin", ""),
+                "continuation_probability": entry.get("continuation_probability", ""),
+                "abs_delta_bps": entry.get("abs_delta_bps", ""),
+                "opening_price": "",
+                "closing_price": "",
+                "price_delta": "",
+                "settlement_source": reason,
+                "decision_latency": "",
+            })
+
+        self.log(
+            f"[FairValue] Released unresolved window {slug}. entries={len(entries)} | "
+            f"reason={reason}. Continuing with fresh windows."
+        )
+        fresh = self._new_fair_value_state()
+        state.clear()
+        state.update(fresh)
+        self.save_state()
+
+    async def _reconcile_stale_fair_value_state(
+        self,
+        state: Dict,
+        current_slug: str,
+        now_ts: float,
+    ) -> bool:
+        active_slug = state.get("active_slug")
+        if not active_slug or active_slug == current_slug or not self._fair_value_entries(state):
+            return True
+
+        previous_start = self._start_time_from_btc_slug(active_slug)
+        if previous_start is None:
+            self._release_unresolved_fair_value_state(
+                state,
+                str(active_slug),
+                "invalid_slug",
+            )
+            self._last_unresolved_fair_value_slug = None
+            return True
+
+        previous_end_ts = previous_start.timestamp() + 300
+        if now_ts < previous_end_ts:
+            return False
+
+        stale_age = max(float(now_ts) - float(previous_end_ts), 0.0)
+        retry_seconds = 5.0
+        last_attempt = float(state.get("last_settlement_attempt_at", 0.0) or 0.0)
+        if now_ts - last_attempt >= retry_seconds:
+            state["last_settlement_attempt_at"] = now_ts
+            self.save_state()
+            settled = await self._settle_active_fair_value_trade(state, str(active_slug), now_ts)
+            if settled:
+                self._last_unresolved_fair_value_slug = None
+                return True
+
+        release_after = float(getattr(self, "fair_value_unresolved_release_seconds", 900.0))
+        if stale_age >= release_after:
+            self._release_unresolved_fair_value_state(
+                state,
+                str(active_slug),
+                f"unresolved_after_{int(release_after)}s",
+            )
+            self._last_unresolved_fair_value_slug = None
+            return True
+
+        last_log = float(getattr(self, "_last_unresolved_fair_value_log_ts", 0.0) or 0.0)
+        if (
+            getattr(self, "_last_unresolved_fair_value_slug", None) != active_slug
+            or now_ts - last_log >= 60.0
+        ):
+            self.log(
+                f"[FairValue] Previous window {active_slug} is waiting for settlement "
+                f"(age={stale_age:.0f}s). Holding new entries briefly."
+            )
+            self._last_unresolved_fair_value_slug = active_slug
+            self._last_unresolved_fair_value_log_ts = now_ts
+        return False
+
+    async def run_fair_value_strategy(self, session: ClientSession):
+        import datetime
+
+        self._ensure_chainlink_price_feed()
+        now_ts = time.time()
+        window_start = int(now_ts // 300) * 300
+        slug = f"btc-updown-5m-{window_start}"
+        if "fair_value_state" not in self.app_state:
+            self.app_state["fair_value_state"] = self._new_fair_value_state()
+        else:
+            self.app_state["fair_value_state"] = self._normalize_fair_value_state(
+                self.app_state["fair_value_state"]
+            )
+        state = self.app_state["fair_value_state"]
+        if "fair_value_giro_probe_state" not in self.app_state:
+            self.app_state["fair_value_giro_probe_state"] = self._new_fair_value_giro_probe_state()
+        else:
+            self.app_state["fair_value_giro_probe_state"] = self._normalize_fair_value_giro_probe_state(
+                self.app_state["fair_value_giro_probe_state"]
+            )
+        giro_probe_state = self.app_state["fair_value_giro_probe_state"]
+        await self._settle_fair_value_giro_probe_windows(giro_probe_state, now_ts)
+
+        if not await self._reconcile_stale_fair_value_state(state, slug, now_ts):
+            return
+        now_ts = time.time()
+        window_start = int(now_ts // 300) * 300
+        slug = f"btc-updown-5m-{window_start}"
+
+        market_data = await self.get_market_by_slug(slug, use_cache=True, cache_ttl=300)
+        if market_data:
+            market_data["slug"] = slug
+        if not market_data:
+            if getattr(self, "_last_logged_no_market_fair_value", None) != window_start:
+                self.log("[FairValue] No active 5m BTC market found right now. Waiting...")
+                self._last_logged_no_market_fair_value = window_start
+            return
+
+        if state.get("active_slug") != slug:
+            state.update(self._new_fair_value_state())
+            state["active_slug"] = slug
+            self.save_state()
+
+        start_time = market_data["start_time"]
+        elapsed = now_ts - start_time.timestamp()
+        context = await self._fair_value_market_context(slug, market_data)
+        if not context:
+            return
+
+        opening_price, latest_price, latest_offset, price_source = await self._fair_value_price_context(
+            start_time.timestamp(),
+            now_ts,
+        )
+        state["kalman"] = kalman_step(
+            state.get("kalman"),
+            latest_price or 0.0,
+            now_ts,
+            opening_price or 0.0,
+            float(window_start),
+        )
+        fair_data = estimate_fair_yes(
+            opening_price=opening_price,
+            latest_price=latest_price,
+            elapsed_seconds=elapsed,
+            sensitivity_bps=float(getattr(self, "fair_value_model_sensitivity_bps", 28.0)),
+        )
+        fair_data = blend_fair_yes_with_market(
+            fair_data,
+            context["yes_metrics"],
+            context["no_metrics"],
+        )
+        fair_data.update((state.get("kalman") or {}).get("features") or {})
+        fair_data["price_source"] = price_source
+        core_decision = self._fair_value_decision(
+            fair_yes=float(fair_data.get("fair_yes") or 0.5),
+            yes_metrics=context["yes_metrics"],
+            no_metrics=context["no_metrics"],
+            state=state,
+            fair_data=fair_data,
+        )
+        core_decision = self._fair_value_apply_entry_model_guard(
+            core_decision,
+            "core_edge",
+            elapsed,
+            state,
+        )
+        momentum_decision = self._fair_value_momentum_decision(
+            fair_yes=float(fair_data.get("fair_yes") or 0.5),
+            fair_data=fair_data,
+            yes_metrics=context["yes_metrics"],
+            no_metrics=context["no_metrics"],
+        )
+        momentum_decision = self._fair_value_apply_entry_model_guard(
+            momentum_decision,
+            "momentum",
+            elapsed,
+            state,
+        )
+        late_continuation_decision = self._fair_value_late_continuation_decision(
+            fair_data=fair_data,
+            yes_metrics=context["yes_metrics"],
+            no_metrics=context["no_metrics"],
+            state=state,
+        )
+        late_continuation_decision = self._fair_value_apply_entry_model_guard(
+            late_continuation_decision,
+            "late_continuation",
+            elapsed,
+            state,
+        )
+        giro_probe_decision = self._fair_value_giro_probe_decision(
+            fair_data=fair_data,
+            yes_metrics=context["yes_metrics"],
+            no_metrics=context["no_metrics"],
+            elapsed=elapsed,
+        )
+        decision, tactic = self._fair_value_select_decision(
+            elapsed=elapsed,
+            core_decision=core_decision,
+            momentum_decision=momentum_decision,
+            late_continuation_decision=late_continuation_decision,
+            state=state,
+        )
+
+        if self._fair_value_signal_interval_elapsed(state, now_ts):
+            self._record_fair_value_signal(
+                self._fair_value_orderbook_row(
+                    slug=slug,
+                    elapsed=elapsed,
+                    token_ids=context["token_ids"],
+                    yes_book=context["yes_book"],
+                    no_book=context["no_book"],
+                    fair_data=fair_data,
+                    decision=decision,
+                    opening_price=opening_price,
+                    latest_price=latest_price,
+                    latest_offset=latest_offset,
+                    state=state,
+                    tactic=tactic,
+                )
+            )
+            state["last_signal_sample_at"] = now_ts
+
+        if giro_probe_decision and giro_probe_decision.should_enter:
+            self._record_fair_value_giro_probe_signal(
+                probe_state=giro_probe_state,
+                slug=slug,
+                decision=giro_probe_decision,
+                fair_data=fair_data,
+                token_ids=context["token_ids"],
+                elapsed=elapsed,
+            )
+
+        if await self._fair_value_handle_maker_candidate(session, state, slug, elapsed, context):
+            self.save_state()
+            return
+
+        cooldown_until = float(state.get("order_error_cooldown_until", 0.0) or 0.0)
+        if (
+            not self.dry_run
+            and bool(getattr(self, "fair_value_live_trading_enabled", False))
+            and cooldown_until > now_ts
+        ):
+            last_log = float(state.get("last_order_cooldown_log_at", 0.0) or 0.0)
+            if now_ts - last_log >= 15.0:
+                self.log(
+                    f"[FairValue] Live order cooldown active for {cooldown_until - now_ts:.0f}s. "
+                    "Skipping entries while CLOB/order execution recovers."
+                )
+                state["last_order_cooldown_log_at"] = now_ts
+                self.save_state()
+            return
+
+        if elapsed > self._fair_value_latest_entry_end():
+            if not self._fair_value_entries(state) and state.get("skip_logged_slug") != slug:
+                self.log(
+                    f"[FairValue] No qualifying entry for {slug} before {self._fair_value_latest_entry_end():.0f}s. "
+                    "Window recorded and skipped."
+                )
+                state["skip_logged_slug"] = slug
+                self.save_state()
+            return
+
+        if not decision.should_enter:
+            return
+
+        token_index = 0 if decision.side == "Yes" else 1
+        token_id = context["token_ids"][token_index]
+        stake = self._fair_value_stake(decision.price)
+        if tactic == "momentum":
+            stake = round(
+                stake * float(getattr(self, "fair_value_momentum_stake_multiplier", 1.0)),
+                2,
+            )
+        elif tactic == "late_continuation":
+            stake = round(
+                stake * float(getattr(self, "fair_value_late_continuation_stake_multiplier", 1.0)),
+                2,
+            )
+        if decision.route == "maker":
+            if self.dry_run or not bool(getattr(self, "fair_value_live_trading_enabled", False)):
+                wait_seconds = max(float(getattr(self, "fair_value_maker_wait_seconds", 3.0)), 0.0)
+                deadline = min(now_ts + wait_seconds, start_time.timestamp() + self._fair_value_latest_entry_end())
+                if deadline > now_ts:
+                    state["maker_candidate"] = {
+                        "slug": slug,
+                        "direction": decision.side,
+                        "token_id": token_id,
+                        "maker_price": decision.maker_price or decision.price,
+                        "created_ts": now_ts,
+                        "deadline_ts": deadline,
+                        "stake_usd": stake,
+                        "fair_probability": decision.fair_probability,
+                        "edge_probability": decision.edge_probability,
+                        "ev_per_usd": decision.ev_per_usd,
+                        "entry_model_win_probability": decision.entry_model_win_probability,
+                        "entry_model_min_probability": decision.entry_model_min_probability,
+                        "break_even_price": decision.break_even_price,
+                        "max_acceptable_price": decision.max_acceptable_price,
+                        "price_margin": decision.price_margin,
+                        "continuation_probability": decision.continuation_probability,
+                        "abs_delta_bps": decision.abs_delta_bps,
+                        "tactic": tactic or "core_edge",
+                    }
+                    state["maker_attempted_slug"] = slug
+                    self._record_fair_value_maker_event({
+                        "event_ts_utc": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+                        "slug": slug,
+                        "dry_run": self.dry_run,
+                        "event": "created",
+                        "tactic": tactic or "core_edge",
+                        "direction": decision.side,
+                        "maker_price": round(float(decision.maker_price or decision.price), 6),
+                        "best_ask": round(float(decision.price), 6),
+                        "elapsed_s": round(float(elapsed), 3),
+                        "stake_usd": round(float(stake), 4),
+                        "fair_probability": round(float(decision.fair_probability), 6),
+                        "edge_probability": round(float(decision.edge_probability), 6),
+                        "ev_per_usd": round(float(decision.ev_per_usd), 6),
+                        "entry_model_win_probability": round(float(decision.entry_model_win_probability), 6),
+                        "entry_model_min_probability": round(float(decision.entry_model_min_probability), 6),
+                        "break_even_price": round(float(decision.break_even_price), 6),
+                        "max_acceptable_price": round(float(decision.max_acceptable_price), 6),
+                        "price_margin": round(float(decision.price_margin), 6),
+                        "continuation_probability": round(float(decision.continuation_probability), 6),
+                        "abs_delta_bps": round(float(decision.abs_delta_bps), 6),
+                    })
+                    self.log(
+                        f"[FairValue] Maker candidate | slug={slug} | direction={decision.side} | "
+                        f"maker_px={decision.price:.4f} | fair={decision.fair_probability:.3f} | "
+                        f"edge={decision.edge_probability * 100:.2f}pp | wait={deadline - now_ts:.1f}s"
+                    )
+                    self.save_state()
+                    return
+                return
+
+        ok, order_text, filled_usd, filled_shares, avg_price, route = await self._fair_value_try_live_entry(
+            session=session,
+            slug=slug,
+            token_id=token_id,
+            direction=decision.side,
+            route=decision.route,
+            price=decision.price,
+            stake_usd=stake,
+            fair_probability=decision.fair_probability,
+            edge_probability=decision.edge_probability,
+            ev_per_usd=decision.ev_per_usd,
+            tactic=tactic or "core_edge",
+            elapsed=elapsed,
+        )
+        if not ok:
+            self.log(f"[FairValue] Entry rejected: {order_text}")
+            if not self.dry_run and bool(getattr(self, "fair_value_live_trading_enabled", False)):
+                self._fair_value_register_order_error(state, slug, order_text)
+                self.save_state()
+            return
+        if not self.dry_run and not bool(getattr(self, "fair_value_live_trading_enabled", False)):
+            route = "paper_live_disabled"
+        self._fair_value_apply_entry(
+            state=state,
+            slug=slug,
+            direction=decision.side,
+            token_id=token_id,
+            route=route,
+            price=float(avg_price if avg_price is not None else decision.price),
+            stake_usd=stake,
+            fair_probability=decision.fair_probability,
+            edge_probability=decision.edge_probability,
+            ev_per_usd=decision.ev_per_usd,
+            elapsed=elapsed,
+            order_text=order_text,
+            filled_usd=filled_usd,
+            filled_shares=filled_shares,
+            tactic=tactic or "core_edge",
+            entry_model_win_probability=decision.entry_model_win_probability,
+            entry_model_min_probability=decision.entry_model_min_probability,
+            break_even_price=decision.break_even_price,
+            max_acceptable_price=decision.max_acceptable_price,
+            price_margin=decision.price_margin,
+            continuation_probability=decision.continuation_probability,
+            abs_delta_bps=decision.abs_delta_bps,
+        )
+        self.save_state()
 
     def _martingale_in_recovery(self, state: Dict) -> bool:
         return int(state.get("streak", 0) or 0) > 0 or float(state.get("loss_bank", 0.0) or 0.0) > 0
@@ -1892,6 +4861,205 @@ class CopyTrader:
                     self.martingale_maker_record_seconds = config.get('martingale_maker_record_seconds', self.martingale_maker_record_seconds)
                     self.martingale_maker_blind_price = config.get('martingale_maker_blind_price', self.martingale_maker_blind_price)
                     self.martingale_maker_blind_end_seconds = config.get('martingale_maker_blind_end_seconds', self.martingale_maker_blind_end_seconds)
+                    self.fair_value_stake_usd = config.get('fair_value_stake_usd', self.fair_value_stake_usd)
+                    self.fair_value_min_taker_edge = config.get('fair_value_min_taker_edge', self.fair_value_min_taker_edge)
+                    self.fair_value_min_maker_edge = config.get('fair_value_min_maker_edge', self.fair_value_min_maker_edge)
+                    self.fair_value_min_ev_per_usd = config.get('fair_value_min_ev_per_usd', self.fair_value_min_ev_per_usd)
+                    self.fair_value_taker_guard_min_edge = config.get(
+                        'fair_value_taker_guard_min_edge',
+                        self.fair_value_taker_guard_min_edge,
+                    )
+                    self.fair_value_taker_guard_min_ev_per_usd = config.get(
+                        'fair_value_taker_guard_min_ev_per_usd',
+                        self.fair_value_taker_guard_min_ev_per_usd,
+                    )
+                    self.fair_value_entry_start_seconds = config.get('fair_value_entry_start_seconds', self.fair_value_entry_start_seconds)
+                    self.fair_value_entry_end_seconds = config.get('fair_value_entry_end_seconds', self.fair_value_entry_end_seconds)
+                    self.fair_value_min_price = config.get('fair_value_min_price', self.fair_value_min_price)
+                    self.fair_value_max_price = config.get('fair_value_max_price', self.fair_value_max_price)
+                    self.fair_value_core_min_price = config.get(
+                        'fair_value_core_min_price',
+                        getattr(self, 'fair_value_core_min_price', self.fair_value_min_price),
+                    )
+                    self.fair_value_core_max_price = config.get(
+                        'fair_value_core_max_price',
+                        getattr(self, 'fair_value_core_max_price', self.fair_value_max_price),
+                    )
+                    self.fair_value_maker_wait_seconds = config.get('fair_value_maker_wait_seconds', self.fair_value_maker_wait_seconds)
+                    self.fair_value_sample_seconds = config.get('fair_value_sample_seconds', self.fair_value_sample_seconds)
+                    self.fair_value_model_sensitivity_bps = config.get('fair_value_model_sensitivity_bps', self.fair_value_model_sensitivity_bps)
+                    self.fair_value_prefer_maker = bool(config.get('fair_value_prefer_maker', self.fair_value_prefer_maker))
+                    self.fair_value_live_trading_enabled = bool(config.get('fair_value_live_trading_enabled', self.fair_value_live_trading_enabled))
+                    self.fair_value_order_type = config.get('fair_value_order_type', self.fair_value_order_type)
+                    self.fair_value_core_enabled = bool(config.get('fair_value_core_enabled', self.fair_value_core_enabled))
+                    self.fair_value_core_contrarian_only = bool(config.get(
+                        'fair_value_core_contrarian_only',
+                        self.fair_value_core_contrarian_only,
+                    ))
+                    self.fair_value_core_max_entries_per_window = config.get(
+                        'fair_value_core_max_entries_per_window',
+                        self.fair_value_core_max_entries_per_window,
+                    )
+                    self.fair_value_min_ev_improvement_per_entry = config.get(
+                        'fair_value_min_ev_improvement_per_entry',
+                        self.fair_value_min_ev_improvement_per_entry,
+                    )
+                    self.fair_value_momentum_enabled = bool(config.get('fair_value_momentum_enabled', self.fair_value_momentum_enabled))
+                    self.fair_value_momentum_start_seconds = config.get('fair_value_momentum_start_seconds', self.fair_value_momentum_start_seconds)
+                    self.fair_value_momentum_end_seconds = config.get('fair_value_momentum_end_seconds', self.fair_value_momentum_end_seconds)
+                    self.fair_value_momentum_min_edge = config.get('fair_value_momentum_min_edge', self.fair_value_momentum_min_edge)
+                    self.fair_value_momentum_min_ev_per_usd = config.get('fair_value_momentum_min_ev_per_usd', self.fair_value_momentum_min_ev_per_usd)
+                    self.fair_value_momentum_min_confidence = config.get('fair_value_momentum_min_confidence', self.fair_value_momentum_min_confidence)
+                    self.fair_value_momentum_max_price = config.get('fair_value_momentum_max_price', self.fair_value_momentum_max_price)
+                    self.fair_value_momentum_stake_multiplier = config.get('fair_value_momentum_stake_multiplier', self.fair_value_momentum_stake_multiplier)
+                    self.fair_value_momentum_max_entries_per_window = config.get(
+                        'fair_value_momentum_max_entries_per_window',
+                        self.fair_value_momentum_max_entries_per_window,
+                    )
+                    self.fair_value_momentum_min_ev_improvement_per_entry = config.get(
+                        'fair_value_momentum_min_ev_improvement_per_entry',
+                        self.fair_value_momentum_min_ev_improvement_per_entry,
+                    )
+                    self.fair_value_late_continuation_enabled = bool(config.get(
+                        'fair_value_late_continuation_enabled',
+                        self.fair_value_late_continuation_enabled,
+                    ))
+                    self.fair_value_late_continuation_start_seconds = config.get(
+                        'fair_value_late_continuation_start_seconds',
+                        self.fair_value_late_continuation_start_seconds,
+                    )
+                    self.fair_value_late_continuation_end_seconds = config.get(
+                        'fair_value_late_continuation_end_seconds',
+                        self.fair_value_late_continuation_end_seconds,
+                    )
+                    self.fair_value_late_continuation_min_abs_delta_bps = config.get(
+                        'fair_value_late_continuation_min_abs_delta_bps',
+                        self.fair_value_late_continuation_min_abs_delta_bps,
+                    )
+                    self.fair_value_late_continuation_min_probability = config.get(
+                        'fair_value_late_continuation_min_probability',
+                        self.fair_value_late_continuation_min_probability,
+                    )
+                    self.fair_value_late_continuation_max_probability = config.get(
+                        'fair_value_late_continuation_max_probability',
+                        self.fair_value_late_continuation_max_probability,
+                    )
+                    self.fair_value_late_continuation_min_ev_per_usd = config.get(
+                        'fair_value_late_continuation_min_ev_per_usd',
+                        self.fair_value_late_continuation_min_ev_per_usd,
+                    )
+                    self.fair_value_late_continuation_price_buffer = config.get(
+                        'fair_value_late_continuation_price_buffer',
+                        self.fair_value_late_continuation_price_buffer,
+                    )
+                    self.fair_value_late_continuation_max_price = config.get(
+                        'fair_value_late_continuation_max_price',
+                        self.fair_value_late_continuation_max_price,
+                    )
+                    self.fair_value_late_continuation_stake_multiplier = config.get(
+                        'fair_value_late_continuation_stake_multiplier',
+                        self.fair_value_late_continuation_stake_multiplier,
+                    )
+                    self.fair_value_late_continuation_max_entries_per_window = config.get(
+                        'fair_value_late_continuation_max_entries_per_window',
+                        self.fair_value_late_continuation_max_entries_per_window,
+                    )
+                    self.fair_value_late_continuation_min_ev_improvement_per_entry = config.get(
+                        'fair_value_late_continuation_min_ev_improvement_per_entry',
+                        self.fair_value_late_continuation_min_ev_improvement_per_entry,
+                    )
+                    self.fair_value_late_continuation_entry_model_min_win_prob = config.get(
+                        'fair_value_late_continuation_entry_model_min_win_prob',
+                        self.fair_value_late_continuation_entry_model_min_win_prob,
+                    )
+                    self.fair_value_giro_probe_enabled = bool(config.get(
+                        'fair_value_giro_probe_enabled',
+                        self.fair_value_giro_probe_enabled,
+                    ))
+                    self.fair_value_giro_probe_start_seconds = config.get(
+                        'fair_value_giro_probe_start_seconds',
+                        self.fair_value_giro_probe_start_seconds,
+                    )
+                    self.fair_value_giro_probe_end_seconds = config.get(
+                        'fair_value_giro_probe_end_seconds',
+                        self.fair_value_giro_probe_end_seconds,
+                    )
+                    self.fair_value_giro_probe_min_price = config.get(
+                        'fair_value_giro_probe_min_price',
+                        self.fair_value_giro_probe_min_price,
+                    )
+                    self.fair_value_giro_probe_max_price = config.get(
+                        'fair_value_giro_probe_max_price',
+                        self.fair_value_giro_probe_max_price,
+                    )
+                    self.fair_value_giro_probe_min_abs_delta_bps = config.get(
+                        'fair_value_giro_probe_min_abs_delta_bps',
+                        self.fair_value_giro_probe_min_abs_delta_bps,
+                    )
+                    self.fair_value_giro_probe_min_probability = config.get(
+                        'fair_value_giro_probe_min_probability',
+                        self.fair_value_giro_probe_min_probability,
+                    )
+                    self.fair_value_giro_probe_min_ev_per_usd = config.get(
+                        'fair_value_giro_probe_min_ev_per_usd',
+                        self.fair_value_giro_probe_min_ev_per_usd,
+                    )
+                    self.fair_value_giro_probe_min_confidence = config.get(
+                        'fair_value_giro_probe_min_confidence',
+                        self.fair_value_giro_probe_min_confidence,
+                    )
+                    self.fair_value_giro_probe_max_entries_per_window = config.get(
+                        'fair_value_giro_probe_max_entries_per_window',
+                        self.fair_value_giro_probe_max_entries_per_window,
+                    )
+                    self.fair_value_giro_probe_min_price_step = config.get(
+                        'fair_value_giro_probe_min_price_step',
+                        self.fair_value_giro_probe_min_price_step,
+                    )
+                    self.fair_value_giro_probe_stake_multiplier = config.get(
+                        'fair_value_giro_probe_stake_multiplier',
+                        self.fair_value_giro_probe_stake_multiplier,
+                    )
+                    self.fair_value_giro_probe_model_enabled = bool(config.get(
+                        'fair_value_giro_probe_model_enabled',
+                        self.fair_value_giro_probe_model_enabled,
+                    ))
+                    self.fair_value_giro_probe_model_path = config.get(
+                        'fair_value_giro_probe_model_path',
+                        self.fair_value_giro_probe_model_path,
+                    )
+                    self.fair_value_entry_model_enabled = bool(config.get(
+                        'fair_value_entry_model_enabled',
+                        self.fair_value_entry_model_enabled,
+                    ))
+                    self.fair_value_core_entry_model_min_win_prob = config.get(
+                        'fair_value_core_entry_model_min_win_prob',
+                        self.fair_value_core_entry_model_min_win_prob,
+                    )
+                    self.fair_value_core_entry_model_max_win_prob = config.get(
+                        'fair_value_core_entry_model_max_win_prob',
+                        self.fair_value_core_entry_model_max_win_prob,
+                    )
+                    self.fair_value_momentum_entry_model_min_win_prob = config.get(
+                        'fair_value_momentum_entry_model_min_win_prob',
+                        self.fair_value_momentum_entry_model_min_win_prob,
+                    )
+                    self.fair_value_shadow_dynamic_stake_enabled = bool(config.get(
+                        'fair_value_shadow_dynamic_stake_enabled',
+                        self.fair_value_shadow_dynamic_stake_enabled,
+                    ))
+                    self.fair_value_shadow_dynamic_stake_min_multiplier = config.get(
+                        'fair_value_shadow_dynamic_stake_min_multiplier',
+                        self.fair_value_shadow_dynamic_stake_min_multiplier,
+                    )
+                    self.fair_value_shadow_dynamic_stake_max_multiplier = config.get(
+                        'fair_value_shadow_dynamic_stake_max_multiplier',
+                        self.fair_value_shadow_dynamic_stake_max_multiplier,
+                    )
+                    self.fair_value_entry_model_path = config.get(
+                        'fair_value_entry_model_path',
+                        self.fair_value_entry_model_path,
+                    )
                     self.martingale_taker_fee_rate = max(float(self.martingale_taker_fee_rate), 0.0)
                     self.martingale_balance_floor_fraction = min(max(float(self.martingale_balance_floor_fraction), 0.0), 1.0)
                     self.martingale_order_type = str(self.martingale_order_type or "FOK").upper()
@@ -1911,6 +5079,166 @@ class CopyTrader:
                     self.martingale_maker_record_seconds = min(max(float(self.martingale_maker_record_seconds), 1.0), 120.0)
                     self.martingale_maker_blind_price = min(max(float(self.martingale_maker_blind_price), 0.40), 0.60)
                     self.martingale_maker_blind_end_seconds = min(max(float(self.martingale_maker_blind_end_seconds), 0.0), 30.0)
+                    self.fair_value_stake_usd = min(max(float(self.fair_value_stake_usd), 0.01), 1000.0)
+                    self.fair_value_min_taker_edge = min(max(float(self.fair_value_min_taker_edge), 0.0), 0.50)
+                    self.fair_value_min_maker_edge = min(max(float(self.fair_value_min_maker_edge), 0.0), 0.50)
+                    self.fair_value_min_ev_per_usd = min(max(float(self.fair_value_min_ev_per_usd), 0.0), 5.0)
+                    self.fair_value_taker_guard_min_edge = min(max(float(self.fair_value_taker_guard_min_edge), 0.0), 0.50)
+                    self.fair_value_taker_guard_min_ev_per_usd = min(max(float(self.fair_value_taker_guard_min_ev_per_usd), 0.0), 5.0)
+                    self.fair_value_entry_start_seconds = min(max(float(self.fair_value_entry_start_seconds), 0.0), 300.0)
+                    self.fair_value_entry_end_seconds = min(max(float(self.fair_value_entry_end_seconds), 1.0), 300.0)
+                    if self.fair_value_entry_end_seconds < self.fair_value_entry_start_seconds:
+                        self.fair_value_entry_end_seconds = self.fair_value_entry_start_seconds
+                    self.fair_value_min_price = min(max(float(self.fair_value_min_price), 0.01), 0.99)
+                    self.fair_value_max_price = min(max(float(self.fair_value_max_price), 0.01), 0.99)
+                    if self.fair_value_min_price > self.fair_value_max_price:
+                        self.fair_value_min_price, self.fair_value_max_price = self.fair_value_max_price, self.fair_value_min_price
+                    core_min_price = float(getattr(self, "fair_value_core_min_price", self.fair_value_min_price))
+                    core_max_price = float(getattr(self, "fair_value_core_max_price", self.fair_value_max_price))
+                    self.fair_value_core_min_price = min(max(core_min_price, 0.01), 0.99)
+                    self.fair_value_core_max_price = min(max(core_max_price, 0.01), 0.99)
+                    if self.fair_value_core_min_price > self.fair_value_core_max_price:
+                        self.fair_value_core_min_price, self.fair_value_core_max_price = (
+                            self.fair_value_core_max_price,
+                            self.fair_value_core_min_price,
+                        )
+                    self.fair_value_maker_wait_seconds = min(max(float(self.fair_value_maker_wait_seconds), 0.0), 30.0)
+                    self.fair_value_sample_seconds = min(max(float(self.fair_value_sample_seconds), 0.1), 10.0)
+                    self.fair_value_model_sensitivity_bps = min(max(float(self.fair_value_model_sensitivity_bps), 1.0), 250.0)
+                    self.fair_value_momentum_start_seconds = min(max(float(self.fair_value_momentum_start_seconds), 0.0), 300.0)
+                    self.fair_value_momentum_end_seconds = min(max(float(self.fair_value_momentum_end_seconds), 1.0), 300.0)
+                    if self.fair_value_momentum_end_seconds < self.fair_value_momentum_start_seconds:
+                        self.fair_value_momentum_end_seconds = self.fair_value_momentum_start_seconds
+                    self.fair_value_momentum_min_edge = min(max(float(self.fair_value_momentum_min_edge), 0.0), 0.50)
+                    self.fair_value_momentum_min_ev_per_usd = min(max(float(self.fair_value_momentum_min_ev_per_usd), 0.0), 5.0)
+                    self.fair_value_momentum_min_confidence = min(max(float(self.fair_value_momentum_min_confidence), 0.0), 1.0)
+                    self.fair_value_momentum_max_price = min(max(float(self.fair_value_momentum_max_price), 0.01), 0.99)
+                    self.fair_value_momentum_stake_multiplier = min(max(float(self.fair_value_momentum_stake_multiplier), 0.01), 25.0)
+                    self.fair_value_order_type = str(self.fair_value_order_type or "FOK").upper()
+                    if self.fair_value_order_type not in ("FAK", "FOK"):
+                        self.fair_value_order_type = "FOK"
+                    self.fair_value_core_max_entries_per_window = min(
+                        max(int(self.fair_value_core_max_entries_per_window), 0),
+                        50,
+                    )
+                    self.fair_value_min_ev_improvement_per_entry = min(
+                        max(float(self.fair_value_min_ev_improvement_per_entry), 0.0),
+                        5.0,
+                    )
+                    self.fair_value_momentum_max_entries_per_window = min(
+                        max(int(self.fair_value_momentum_max_entries_per_window), 0),
+                        50,
+                    )
+                    self.fair_value_momentum_min_ev_improvement_per_entry = min(
+                        max(float(self.fair_value_momentum_min_ev_improvement_per_entry), 0.0),
+                        5.0,
+                    )
+                    self.fair_value_late_continuation_start_seconds = min(
+                        max(float(self.fair_value_late_continuation_start_seconds), 0.0),
+                        300.0,
+                    )
+                    self.fair_value_late_continuation_end_seconds = min(
+                        max(float(self.fair_value_late_continuation_end_seconds), 1.0),
+                        300.0,
+                    )
+                    if self.fair_value_late_continuation_end_seconds < self.fair_value_late_continuation_start_seconds:
+                        self.fair_value_late_continuation_end_seconds = self.fair_value_late_continuation_start_seconds
+                    self.fair_value_late_continuation_min_abs_delta_bps = min(
+                        max(float(self.fair_value_late_continuation_min_abs_delta_bps), 0.0),
+                        250.0,
+                    )
+                    self.fair_value_late_continuation_min_probability = min(
+                        max(float(self.fair_value_late_continuation_min_probability), 0.5),
+                        0.999,
+                    )
+                    self.fair_value_late_continuation_max_probability = min(
+                        max(float(self.fair_value_late_continuation_max_probability), 0.5),
+                        0.999,
+                    )
+                    if self.fair_value_late_continuation_min_probability > self.fair_value_late_continuation_max_probability:
+                        self.fair_value_late_continuation_min_probability, self.fair_value_late_continuation_max_probability = (
+                            self.fair_value_late_continuation_max_probability,
+                            self.fair_value_late_continuation_min_probability,
+                        )
+                    self.fair_value_late_continuation_min_ev_per_usd = min(
+                        max(float(self.fair_value_late_continuation_min_ev_per_usd), 0.0),
+                        5.0,
+                    )
+                    self.fair_value_late_continuation_price_buffer = min(
+                        max(float(self.fair_value_late_continuation_price_buffer), 0.0),
+                        0.25,
+                    )
+                    self.fair_value_late_continuation_max_price = min(
+                        max(float(self.fair_value_late_continuation_max_price), 0.01),
+                        0.99,
+                    )
+                    self.fair_value_late_continuation_stake_multiplier = min(
+                        max(float(self.fair_value_late_continuation_stake_multiplier), 0.01),
+                        25.0,
+                    )
+                    self.fair_value_late_continuation_max_entries_per_window = min(
+                        max(int(self.fair_value_late_continuation_max_entries_per_window), 0),
+                        50,
+                    )
+                    self.fair_value_late_continuation_min_ev_improvement_per_entry = min(
+                        max(float(self.fair_value_late_continuation_min_ev_improvement_per_entry), 0.0),
+                        5.0,
+                    )
+                    self.fair_value_late_continuation_entry_model_min_win_prob = min(
+                        max(float(self.fair_value_late_continuation_entry_model_min_win_prob), 0.0),
+                        1.0,
+                    )
+                    self.fair_value_giro_probe_start_seconds = min(max(float(self.fair_value_giro_probe_start_seconds), 0.0), 300.0)
+                    self.fair_value_giro_probe_end_seconds = min(max(float(self.fair_value_giro_probe_end_seconds), 1.0), 300.0)
+                    if self.fair_value_giro_probe_end_seconds < self.fair_value_giro_probe_start_seconds:
+                        self.fair_value_giro_probe_end_seconds = self.fair_value_giro_probe_start_seconds
+                    self.fair_value_giro_probe_min_price = min(max(float(self.fair_value_giro_probe_min_price), 0.01), 0.99)
+                    self.fair_value_giro_probe_max_price = min(max(float(self.fair_value_giro_probe_max_price), 0.01), 0.99)
+                    if self.fair_value_giro_probe_min_price > self.fair_value_giro_probe_max_price:
+                        self.fair_value_giro_probe_min_price, self.fair_value_giro_probe_max_price = (
+                            self.fair_value_giro_probe_max_price,
+                            self.fair_value_giro_probe_min_price,
+                        )
+                    self.fair_value_giro_probe_min_abs_delta_bps = min(max(float(self.fair_value_giro_probe_min_abs_delta_bps), 0.0), 250.0)
+                    self.fair_value_giro_probe_min_probability = min(max(float(self.fair_value_giro_probe_min_probability), 0.0), 1.0)
+                    self.fair_value_giro_probe_min_ev_per_usd = min(max(float(self.fair_value_giro_probe_min_ev_per_usd), -1.0), 10.0)
+                    self.fair_value_giro_probe_min_confidence = min(max(float(self.fair_value_giro_probe_min_confidence), 0.0), 1.0)
+                    self.fair_value_giro_probe_max_entries_per_window = min(max(int(self.fair_value_giro_probe_max_entries_per_window), 0), 100)
+                    self.fair_value_giro_probe_min_price_step = min(max(float(self.fair_value_giro_probe_min_price_step), 0.0), 0.50)
+                    self.fair_value_giro_probe_stake_multiplier = min(max(float(self.fair_value_giro_probe_stake_multiplier), 0.01), 25.0)
+                    self.fair_value_giro_probe_model_path = str(self.fair_value_giro_probe_model_path or os.path.join(
+                        self.data_dir,
+                        "cheap_reversal",
+                        "cheap_reversal_model.json",
+                    ))
+                    self.fair_value_core_entry_model_min_win_prob = min(
+                        max(float(self.fair_value_core_entry_model_min_win_prob), 0.0),
+                        1.0,
+                    )
+                    self.fair_value_core_entry_model_max_win_prob = min(
+                        max(float(self.fair_value_core_entry_model_max_win_prob), 0.0),
+                        1.0,
+                    )
+                    if self.fair_value_core_entry_model_min_win_prob > self.fair_value_core_entry_model_max_win_prob:
+                        self.fair_value_core_entry_model_min_win_prob, self.fair_value_core_entry_model_max_win_prob = (
+                            self.fair_value_core_entry_model_max_win_prob,
+                            self.fair_value_core_entry_model_min_win_prob,
+                        )
+                    self.fair_value_momentum_entry_model_min_win_prob = min(
+                        max(float(self.fair_value_momentum_entry_model_min_win_prob), 0.0),
+                        1.0,
+                    )
+                    self.fair_value_shadow_dynamic_stake_min_multiplier = min(
+                        max(float(self.fair_value_shadow_dynamic_stake_min_multiplier), 0.01),
+                        10.0,
+                    )
+                    self.fair_value_shadow_dynamic_stake_max_multiplier = min(
+                        max(
+                            float(self.fair_value_shadow_dynamic_stake_max_multiplier),
+                            self.fair_value_shadow_dynamic_stake_min_multiplier,
+                        ),
+                        10.0,
+                    )
                     self.martingale_entry_end_seconds = 265
                     if self.martingale_min_entry_price < 0.40:
                         self.martingale_min_entry_price = 0.40
@@ -1947,6 +5275,14 @@ class CopyTrader:
                         martingale_state.setdefault("entry_attempts", 0)
                         martingale_state.setdefault("skip_logged", False)
                         self.app_state["martingale_state"] = self._normalize_martingale_state(martingale_state)
+                    fair_value_state = data.get('fair_value_state')
+                    if fair_value_state:
+                        self.app_state["fair_value_state"] = self._normalize_fair_value_state(fair_value_state)
+                    fair_value_giro_probe_state = data.get('fair_value_giro_probe_state')
+                    if fair_value_giro_probe_state:
+                        self.app_state["fair_value_giro_probe_state"] = self._normalize_fair_value_giro_probe_state(
+                            fair_value_giro_probe_state
+                        )
                     self.history = data.get('history', [])
                     self.log(f"State loaded from {self.data_file}")
             except Exception as e:
@@ -1960,6 +5296,15 @@ class CopyTrader:
             opened_at = martingale_state.get("opened_at")
             if hasattr(opened_at, "isoformat"):
                 martingale_state["opened_at"] = opened_at.isoformat()
+        fair_value_state = self.app_state.get("fair_value_state")
+        if fair_value_state:
+            fair_value_state = fair_value_state.copy()
+            opened_at = fair_value_state.get("opened_at")
+            if hasattr(opened_at, "isoformat"):
+                fair_value_state["opened_at"] = opened_at.isoformat()
+        fair_value_giro_probe_state = self.app_state.get("fair_value_giro_probe_state")
+        if fair_value_giro_probe_state:
+            fair_value_giro_probe_state = fair_value_giro_probe_state.copy()
         data = {
             "config": {
                 "target_wallets": self.target_wallets,
@@ -1992,12 +5337,81 @@ class CopyTrader:
                 "martingale_maker_sample_seconds": self.martingale_maker_sample_seconds,
                 "martingale_maker_record_seconds": self.martingale_maker_record_seconds,
                 "martingale_maker_blind_price": self.martingale_maker_blind_price,
-                "martingale_maker_blind_end_seconds": self.martingale_maker_blind_end_seconds
+                "martingale_maker_blind_end_seconds": self.martingale_maker_blind_end_seconds,
+                "fair_value_stake_usd": self.fair_value_stake_usd,
+                "fair_value_min_taker_edge": self.fair_value_min_taker_edge,
+                "fair_value_min_maker_edge": self.fair_value_min_maker_edge,
+                "fair_value_min_ev_per_usd": self.fair_value_min_ev_per_usd,
+                "fair_value_taker_guard_min_edge": self.fair_value_taker_guard_min_edge,
+                "fair_value_taker_guard_min_ev_per_usd": self.fair_value_taker_guard_min_ev_per_usd,
+                "fair_value_entry_start_seconds": self.fair_value_entry_start_seconds,
+                "fair_value_entry_end_seconds": self.fair_value_entry_end_seconds,
+                "fair_value_min_price": self.fair_value_min_price,
+                "fair_value_max_price": self.fair_value_max_price,
+                "fair_value_core_min_price": self.fair_value_core_min_price,
+                "fair_value_core_max_price": self.fair_value_core_max_price,
+                "fair_value_maker_wait_seconds": self.fair_value_maker_wait_seconds,
+                "fair_value_sample_seconds": self.fair_value_sample_seconds,
+                "fair_value_model_sensitivity_bps": self.fair_value_model_sensitivity_bps,
+                "fair_value_prefer_maker": self.fair_value_prefer_maker,
+                "fair_value_live_trading_enabled": self.fair_value_live_trading_enabled,
+                "fair_value_order_type": self.fair_value_order_type,
+                "fair_value_core_enabled": self.fair_value_core_enabled,
+                "fair_value_core_contrarian_only": self.fair_value_core_contrarian_only,
+                "fair_value_core_max_entries_per_window": self.fair_value_core_max_entries_per_window,
+                "fair_value_min_ev_improvement_per_entry": self.fair_value_min_ev_improvement_per_entry,
+                "fair_value_momentum_enabled": self.fair_value_momentum_enabled,
+                "fair_value_momentum_start_seconds": self.fair_value_momentum_start_seconds,
+                "fair_value_momentum_end_seconds": self.fair_value_momentum_end_seconds,
+                "fair_value_momentum_min_edge": self.fair_value_momentum_min_edge,
+                "fair_value_momentum_min_ev_per_usd": self.fair_value_momentum_min_ev_per_usd,
+                "fair_value_momentum_min_confidence": self.fair_value_momentum_min_confidence,
+                "fair_value_momentum_max_price": self.fair_value_momentum_max_price,
+                "fair_value_momentum_stake_multiplier": self.fair_value_momentum_stake_multiplier,
+                "fair_value_momentum_max_entries_per_window": self.fair_value_momentum_max_entries_per_window,
+                "fair_value_momentum_min_ev_improvement_per_entry": self.fair_value_momentum_min_ev_improvement_per_entry,
+                "fair_value_late_continuation_enabled": self.fair_value_late_continuation_enabled,
+                "fair_value_late_continuation_start_seconds": self.fair_value_late_continuation_start_seconds,
+                "fair_value_late_continuation_end_seconds": self.fair_value_late_continuation_end_seconds,
+                "fair_value_late_continuation_min_abs_delta_bps": self.fair_value_late_continuation_min_abs_delta_bps,
+                "fair_value_late_continuation_min_probability": self.fair_value_late_continuation_min_probability,
+                "fair_value_late_continuation_max_probability": self.fair_value_late_continuation_max_probability,
+                "fair_value_late_continuation_min_ev_per_usd": self.fair_value_late_continuation_min_ev_per_usd,
+                "fair_value_late_continuation_price_buffer": self.fair_value_late_continuation_price_buffer,
+                "fair_value_late_continuation_max_price": self.fair_value_late_continuation_max_price,
+                "fair_value_late_continuation_stake_multiplier": self.fair_value_late_continuation_stake_multiplier,
+                "fair_value_late_continuation_max_entries_per_window": self.fair_value_late_continuation_max_entries_per_window,
+                "fair_value_late_continuation_min_ev_improvement_per_entry": self.fair_value_late_continuation_min_ev_improvement_per_entry,
+                "fair_value_late_continuation_entry_model_min_win_prob": self.fair_value_late_continuation_entry_model_min_win_prob,
+                "fair_value_giro_probe_enabled": self.fair_value_giro_probe_enabled,
+                "fair_value_giro_probe_start_seconds": self.fair_value_giro_probe_start_seconds,
+                "fair_value_giro_probe_end_seconds": self.fair_value_giro_probe_end_seconds,
+                "fair_value_giro_probe_min_price": self.fair_value_giro_probe_min_price,
+                "fair_value_giro_probe_max_price": self.fair_value_giro_probe_max_price,
+                "fair_value_giro_probe_min_abs_delta_bps": self.fair_value_giro_probe_min_abs_delta_bps,
+                "fair_value_giro_probe_min_probability": self.fair_value_giro_probe_min_probability,
+                "fair_value_giro_probe_min_ev_per_usd": self.fair_value_giro_probe_min_ev_per_usd,
+                "fair_value_giro_probe_min_confidence": self.fair_value_giro_probe_min_confidence,
+                "fair_value_giro_probe_max_entries_per_window": self.fair_value_giro_probe_max_entries_per_window,
+                "fair_value_giro_probe_min_price_step": self.fair_value_giro_probe_min_price_step,
+                "fair_value_giro_probe_stake_multiplier": self.fair_value_giro_probe_stake_multiplier,
+                "fair_value_giro_probe_model_enabled": self.fair_value_giro_probe_model_enabled,
+                "fair_value_giro_probe_model_path": self.fair_value_giro_probe_model_path,
+                "fair_value_entry_model_enabled": self.fair_value_entry_model_enabled,
+                "fair_value_core_entry_model_min_win_prob": self.fair_value_core_entry_model_min_win_prob,
+                "fair_value_core_entry_model_max_win_prob": self.fair_value_core_entry_model_max_win_prob,
+                "fair_value_momentum_entry_model_min_win_prob": self.fair_value_momentum_entry_model_min_win_prob,
+                "fair_value_shadow_dynamic_stake_enabled": self.fair_value_shadow_dynamic_stake_enabled,
+                "fair_value_shadow_dynamic_stake_min_multiplier": self.fair_value_shadow_dynamic_stake_min_multiplier,
+                "fair_value_shadow_dynamic_stake_max_multiplier": self.fair_value_shadow_dynamic_stake_max_multiplier,
+                "fair_value_entry_model_path": self.fair_value_entry_model_path
             },
             "multipliers": self.app_state["multipliers"],
             "history": self.history,
             "pending_settlements": self.app_state.get("pending_settlements", []),
-            "martingale_state": martingale_state
+            "martingale_state": martingale_state,
+            "fair_value_state": fair_value_state,
+            "fair_value_giro_probe_state": fair_value_giro_probe_state
         }
         try:
             with open(self.data_file, 'w') as f:
@@ -2053,6 +5467,74 @@ class CopyTrader:
                 f"sample={self.martingale_maker_sample_seconds:.1f}s | "
                 f"record={self.martingale_maker_record_seconds:.1f}s"
             )
+        if self._is_fair_value_mode():
+            self.log(
+                "[FairValue] Recorder enabled | "
+                f"signals={os.path.join(self.data_dir, 'fair_value_signals.csv')} | "
+                f"entries={os.path.join(self.data_dir, 'fair_value_entries.csv')} | "
+                f"maker={os.path.join(self.data_dir, 'fair_value_maker_events.csv')} | "
+                f"outcomes={os.path.join(self.data_dir, 'fair_value_outcomes.csv')} | "
+                f"giro_probe_entries={os.path.join(self.data_dir, 'fair_value_giro_probe_entries.csv')} | "
+                f"giro_probe_outcomes={os.path.join(self.data_dir, 'fair_value_giro_probe_outcomes.csv')}"
+            )
+            self.log(
+                "[FairValue] Config | "
+                f"stake=${self.fair_value_stake_usd:.2f} | "
+                f"taker_edge={self.fair_value_min_taker_edge * 100:.2f}pp | "
+                f"maker_edge={self.fair_value_min_maker_edge * 100:.2f}pp | "
+                f"min_ev=${self.fair_value_min_ev_per_usd:.2f}/$ | "
+                f"taker_guard={self.fair_value_taker_guard_min_edge * 100:.2f}pp/"
+                f"${self.fair_value_taker_guard_min_ev_per_usd:.2f}/$ | "
+                f"entry={self.fair_value_entry_start_seconds:.0f}-{self.fair_value_entry_end_seconds:.0f}s | "
+                f"core={'on' if self.fair_value_core_enabled else 'off'} "
+                f"{'giro' if self.fair_value_core_contrarian_only else 'any'} "
+                f"px={self.fair_value_core_min_price:.2f}-{self.fair_value_core_max_price:.2f} "
+                f"max={self.fair_value_core_max_entries_per_window} | "
+                f"momentum={'on' if self.fair_value_momentum_enabled else 'off'} "
+                f"{self.fair_value_momentum_start_seconds:.0f}-{self.fair_value_momentum_end_seconds:.0f}s | "
+                f"momentum_ev=${self.fair_value_momentum_min_ev_per_usd:.2f}/$ | "
+                f"momentum_max={self.fair_value_momentum_max_entries_per_window} | "
+                f"late_cont={'on' if self.fair_value_late_continuation_enabled else 'off'} "
+                f"{self.fair_value_late_continuation_start_seconds:.0f}-{self.fair_value_late_continuation_end_seconds:.0f}s "
+                f"p={self.fair_value_late_continuation_min_probability:.2f}-{self.fair_value_late_continuation_max_probability:.2f} "
+                f"delta>={self.fair_value_late_continuation_min_abs_delta_bps:.1f}bps | "
+                f"giro_probe={'on' if self.fair_value_giro_probe_enabled else 'off'} "
+                f"{self.fair_value_giro_probe_start_seconds:.0f}-{self.fair_value_giro_probe_end_seconds:.0f}s "
+                f"px={self.fair_value_giro_probe_min_price:.2f}-{self.fair_value_giro_probe_max_price:.2f} "
+                f"p>={self.fair_value_giro_probe_min_probability:.2f} "
+                f"ev>={self.fair_value_giro_probe_min_ev_per_usd:.2f}/$ "
+                f"conf>={self.fair_value_giro_probe_min_confidence:.2f} "
+                f"max={self.fair_value_giro_probe_max_entries_per_window} | "
+                f"shadow_stake={'on' if self.fair_value_shadow_dynamic_stake_enabled else 'off'} "
+                f"{self.fair_value_shadow_dynamic_stake_min_multiplier:.2f}-"
+                f"{self.fair_value_shadow_dynamic_stake_max_multiplier:.2f}x | "
+                f"sample={self.fair_value_sample_seconds:.1f}s | "
+                f"live_orders={bool(self.fair_value_live_trading_enabled)}"
+            )
+            if bool(getattr(self, "fair_value_entry_model_enabled", True)):
+                self.log(
+                    "[FairValueModel] Guard enabled | "
+                    f"core_p={self.fair_value_core_entry_model_min_win_prob:.2f}-{self.fair_value_core_entry_model_max_win_prob:.2f} | "
+                    f"momentum_min_p={self.fair_value_momentum_entry_model_min_win_prob:.2f} | "
+                    f"late_min_p={self.fair_value_late_continuation_entry_model_min_win_prob:.2f}"
+                )
+            if bool(getattr(self, "fair_value_giro_probe_model_enabled", True)):
+                self.log(
+                    "[CheapReversalModel] Giro probe model enabled | "
+                    f"path={getattr(self, 'fair_value_giro_probe_model_path', '')}"
+                )
+            if bool(getattr(self, "fair_value_supervisor_enabled", True)):
+                self.log(
+                    "[Supervisor] Recommendation-only mode enabled | "
+                    f"interval={float(getattr(self, 'fair_value_supervisor_interval_seconds', 7200.0)) / 3600.0:.1f}h | "
+                    "no auto changes, dry-run only."
+                )
+            if bool(getattr(self, "fair_value_entry_model_auto_retrain_enabled", True)):
+                self.log(
+                    "[FairValueModel] Auto retrain enabled | "
+                    f"interval={float(getattr(self, 'fair_value_entry_model_auto_retrain_interval_seconds', 7200.0)) / 3600.0:.1f}h | "
+                    "promotes only after holdout validation and only in dry run."
+                )
         self._task = asyncio.create_task(self._monitor_loop())
 
     async def stop(self):
@@ -2108,6 +5590,9 @@ class CopyTrader:
                             self._last_reconcile_ts = now_ts
                         
                         await self.tick(session)
+                        if self._is_fair_value_mode():
+                            await self._fair_value_supervisor_if_due(now_ts)
+                            await self._fair_value_entry_model_retrain_if_due(now_ts)
                         if self._last_heartbeat_ts is None or (now_ts - self._last_heartbeat_ts) >= 60:
                             self.log(
                                 f"[Heartbeat] running=True | strategy={self.strategy_mode} | "
@@ -2118,9 +5603,14 @@ class CopyTrader:
                             self._last_heartbeat_ts = now_ts
                         tick_elapsed = time.time() - now_ts
                         sleep_for = max(0.05, float(self.poll_interval) - tick_elapsed)
-                        if self._is_martingale_mode():
+                        if self._is_martingale_mode() or self._is_fair_value_mode():
                             now_after_tick = time.time()
                             seconds_to_boundary = 300.0 - (now_after_tick % 300.0)
+                            if self._is_fair_value_mode():
+                                sleep_for = min(
+                                    sleep_for,
+                                    max(float(getattr(self, "fair_value_sample_seconds", 1.0)), 0.1),
+                                )
                             if seconds_to_boundary <= 2.0 or seconds_to_boundary >= 299.0:
                                 sleep_for = min(sleep_for, 0.10)
                             elif seconds_to_boundary <= 10.0:
@@ -2139,6 +5629,9 @@ class CopyTrader:
             # Branch based on Strategy Mode
             if self._is_martingale_mode():
                 await self.run_martingale_strategy(session)
+                return
+            elif self._is_fair_value_mode():
+                await self.run_fair_value_strategy(session)
                 return
             elif self.strategy_mode == 'winning':
                 await self.run_winning_strategy(session)
@@ -3223,29 +6716,39 @@ class CopyTrader:
 
         http_session = await self._get_http_session()
         url = f"https://gamma-api.polymarket.com/events?slug={slug}"
+        last_exc = None
         try:
-            async with http_session.get(url) as response:
-                if response.status == 200:
-                    data = await response.json()
-                    if isinstance(data, list) and len(data) > 0:
-                        event = data[0]
-                        start_str = event.get('startTime') or event.get('startDate')
-                        if start_str:
-                            start_time = datetime.datetime.fromisoformat(start_str.replace("Z", "+00:00"))
-                            result = {'start_time': start_time, 'markets': event.get('markets', [])}
-                            if use_cache:
-                                import time
-                                self._martingale_market_cache[slug] = {"ts": time.time(), "data": result}
-                                if len(self._martingale_market_cache) > 12:
-                                    oldest = sorted(
-                                        self._martingale_market_cache,
-                                        key=lambda key: self._martingale_market_cache[key]["ts"],
-                                    )[:4]
-                                    for key in oldest:
-                                        self._martingale_market_cache.pop(key, None)
-                            return result
-        except Exception:
-            pass
+            if not self._polymarket_backoff_active(url):
+                async with http_session.get(url) as response:
+                    if response.status == 200:
+                        data = await response.json()
+                        self._mark_polymarket_http_success(url)
+                    else:
+                        data = None
+            else:
+                data = None
+        except Exception as exc:
+            last_exc = exc
+            data = None
+        if not data and last_exc is not None:
+            data = await self._polymarket_get_json_fallback(url, timeout=8.0)
+        if isinstance(data, list) and len(data) > 0:
+            event = data[0]
+            start_str = event.get('startTime') or event.get('startDate')
+            if start_str:
+                start_time = datetime.datetime.fromisoformat(start_str.replace("Z", "+00:00"))
+                result = {'start_time': start_time, 'markets': event.get('markets', [])}
+                if use_cache:
+                    import time
+                    self._martingale_market_cache[slug] = {"ts": time.time(), "data": result}
+                    if len(self._martingale_market_cache) > 12:
+                        oldest = sorted(
+                            self._martingale_market_cache,
+                            key=lambda key: self._martingale_market_cache[key]["ts"],
+                        )[:4]
+                        for key in oldest:
+                            self._martingale_market_cache.pop(key, None)
+                return result
         return None
 
     async def fetch_price(self, asset_id: str) -> float:
@@ -3253,13 +6756,23 @@ class CopyTrader:
 
         http_session = await self._get_http_session()
         url = f"https://clob.polymarket.com/price?token_id={asset_id}&side=buy"
+        data = None
+        last_exc = None
         try:
-            async with http_session.get(url, timeout=aiohttp.ClientTimeout(total=5)) as response:
-                if response.status == 200:
-                    data = await response.json()
-                    return float(data.get('price', 0))
-        except Exception:
-            pass
+            if not self._polymarket_backoff_active(url):
+                async with http_session.get(url, timeout=aiohttp.ClientTimeout(total=5)) as response:
+                    if response.status == 200:
+                        data = await response.json()
+                        self._mark_polymarket_http_success(url)
+        except Exception as exc:
+            last_exc = exc
+        if not data and last_exc is not None:
+            data = await self._polymarket_get_json_fallback(url, timeout=6.0)
+        if isinstance(data, dict):
+            try:
+                return float(data.get('price', 0))
+            except Exception:
+                return 0.0
         return 0.0
 
     async def fetch_buy_price(self, asset_id: str) -> float:
@@ -3337,15 +6850,153 @@ class CopyTrader:
         martingale_maker_record_seconds: float = None,
         martingale_maker_blind_price: float = None,
         martingale_maker_blind_end_seconds: float = None,
+        fair_value_stake_usd: float = None,
+        fair_value_min_taker_edge: float = None,
+        fair_value_min_maker_edge: float = None,
+        fair_value_min_ev_per_usd: float = None,
+        fair_value_taker_guard_min_edge: float = None,
+        fair_value_taker_guard_min_ev_per_usd: float = None,
+        fair_value_entry_start_seconds: float = None,
+        fair_value_entry_end_seconds: float = None,
+        fair_value_min_price: float = None,
+        fair_value_max_price: float = None,
+        fair_value_core_min_price: float = None,
+        fair_value_core_max_price: float = None,
+        fair_value_maker_wait_seconds: float = None,
+        fair_value_sample_seconds: float = None,
+        fair_value_model_sensitivity_bps: float = None,
+        fair_value_prefer_maker: bool = None,
+        fair_value_live_trading_enabled: bool = None,
+        fair_value_core_enabled: bool = None,
+        fair_value_core_contrarian_only: bool = None,
+        fair_value_core_max_entries_per_window: int = None,
+        fair_value_min_ev_improvement_per_entry: float = None,
+        fair_value_momentum_enabled: bool = None,
+        fair_value_momentum_start_seconds: float = None,
+        fair_value_momentum_end_seconds: float = None,
+        fair_value_momentum_min_edge: float = None,
+        fair_value_momentum_min_ev_per_usd: float = None,
+        fair_value_momentum_min_confidence: float = None,
+        fair_value_momentum_max_price: float = None,
+        fair_value_momentum_stake_multiplier: float = None,
+        fair_value_momentum_max_entries_per_window: int = None,
+        fair_value_momentum_min_ev_improvement_per_entry: float = None,
+        fair_value_late_continuation_enabled: bool = None,
+        fair_value_late_continuation_start_seconds: float = None,
+        fair_value_late_continuation_end_seconds: float = None,
+        fair_value_late_continuation_min_abs_delta_bps: float = None,
+        fair_value_late_continuation_min_probability: float = None,
+        fair_value_late_continuation_max_probability: float = None,
+        fair_value_late_continuation_min_ev_per_usd: float = None,
+        fair_value_late_continuation_price_buffer: float = None,
+        fair_value_late_continuation_max_price: float = None,
+        fair_value_late_continuation_stake_multiplier: float = None,
+        fair_value_late_continuation_max_entries_per_window: int = None,
+        fair_value_late_continuation_min_ev_improvement_per_entry: float = None,
+        fair_value_late_continuation_entry_model_min_win_prob: float = None,
+        fair_value_giro_probe_enabled: bool = None,
+        fair_value_giro_probe_start_seconds: float = None,
+        fair_value_giro_probe_end_seconds: float = None,
+        fair_value_giro_probe_min_price: float = None,
+        fair_value_giro_probe_max_price: float = None,
+        fair_value_giro_probe_min_abs_delta_bps: float = None,
+        fair_value_giro_probe_min_probability: float = None,
+        fair_value_giro_probe_min_ev_per_usd: float = None,
+        fair_value_giro_probe_min_confidence: float = None,
+        fair_value_giro_probe_max_entries_per_window: int = None,
+        fair_value_giro_probe_min_price_step: float = None,
+        fair_value_giro_probe_stake_multiplier: float = None,
+        fair_value_entry_model_enabled: bool = None,
+        fair_value_core_entry_model_min_win_prob: float = None,
+        fair_value_core_entry_model_max_win_prob: float = None,
+        fair_value_momentum_entry_model_min_win_prob: float = None,
+        fair_value_shadow_dynamic_stake_enabled: bool = None,
+        fair_value_shadow_dynamic_stake_min_multiplier: float = None,
+        fair_value_shadow_dynamic_stake_max_multiplier: float = None,
     ):
         previous_dry_run = bool(self.dry_run)
         previous_strategy_mode = self.strategy_mode
+        fair_defaults = {
+            "fair_value_stake_usd": 1.0,
+            "fair_value_min_taker_edge": 0.10,
+            "fair_value_min_maker_edge": 0.10,
+            "fair_value_min_ev_per_usd": 0.30,
+            "fair_value_taker_guard_min_edge": 0.06,
+            "fair_value_taker_guard_min_ev_per_usd": 0.12,
+            "fair_value_entry_start_seconds": 0.0,
+            "fair_value_entry_end_seconds": 240.0,
+            "fair_value_min_price": 0.35,
+            "fair_value_max_price": 0.50,
+            "fair_value_core_min_price": 0.35,
+            "fair_value_core_max_price": 0.50,
+            "fair_value_maker_wait_seconds": 3.0,
+            "fair_value_sample_seconds": 1.0,
+            "fair_value_model_sensitivity_bps": 28.0,
+            "fair_value_prefer_maker": True,
+            "fair_value_live_trading_enabled": False,
+            "fair_value_core_enabled": True,
+            "fair_value_core_contrarian_only": False,
+            "fair_value_core_max_entries_per_window": 2,
+            "fair_value_min_ev_improvement_per_entry": 0.03,
+            "fair_value_momentum_enabled": True,
+            "fair_value_momentum_start_seconds": 240.0,
+            "fair_value_momentum_end_seconds": 300.0,
+            "fair_value_momentum_min_edge": 0.03,
+            "fair_value_momentum_min_ev_per_usd": 0.12,
+            "fair_value_momentum_min_confidence": 0.10,
+            "fair_value_momentum_max_price": 0.90,
+            "fair_value_momentum_stake_multiplier": 1.0,
+            "fair_value_momentum_max_entries_per_window": 2,
+            "fair_value_momentum_min_ev_improvement_per_entry": 0.04,
+            "fair_value_late_continuation_enabled": True,
+            "fair_value_late_continuation_start_seconds": 250.0,
+            "fair_value_late_continuation_end_seconds": 300.0,
+            "fair_value_late_continuation_min_abs_delta_bps": 5.0,
+            "fair_value_late_continuation_min_probability": 0.87,
+            "fair_value_late_continuation_max_probability": 0.95,
+            "fair_value_late_continuation_min_ev_per_usd": 0.015,
+            "fair_value_late_continuation_price_buffer": 0.01,
+            "fair_value_late_continuation_max_price": 0.95,
+            "fair_value_late_continuation_stake_multiplier": 1.0,
+            "fair_value_late_continuation_max_entries_per_window": 2,
+            "fair_value_late_continuation_min_ev_improvement_per_entry": 0.03,
+            "fair_value_late_continuation_entry_model_min_win_prob": 0.0,
+            "fair_value_giro_probe_enabled": True,
+            "fair_value_giro_probe_start_seconds": 0.0,
+            "fair_value_giro_probe_end_seconds": 300.0,
+            "fair_value_giro_probe_min_price": 0.15,
+            "fair_value_giro_probe_max_price": 0.42,
+            "fair_value_giro_probe_min_abs_delta_bps": 0.5,
+            "fair_value_giro_probe_min_probability": 0.45,
+            "fair_value_giro_probe_min_ev_per_usd": 0.05,
+            "fair_value_giro_probe_min_confidence": 0.10,
+            "fair_value_giro_probe_max_entries_per_window": 2,
+            "fair_value_giro_probe_min_price_step": 0.03,
+            "fair_value_giro_probe_stake_multiplier": 1.0,
+            "fair_value_giro_probe_model_enabled": True,
+            "fair_value_giro_probe_model_path": os.path.join(
+                self.data_dir,
+                "cheap_reversal",
+                "cheap_reversal_model.json",
+            ),
+            "fair_value_entry_model_enabled": True,
+            "fair_value_core_entry_model_min_win_prob": 0.46,
+            "fair_value_core_entry_model_max_win_prob": 0.54,
+            "fair_value_momentum_entry_model_min_win_prob": 0.63,
+            "fair_value_shadow_dynamic_stake_enabled": True,
+            "fair_value_shadow_dynamic_stake_min_multiplier": 1.0,
+            "fair_value_shadow_dynamic_stake_max_multiplier": 2.0,
+        }
+        for attr, default in fair_defaults.items():
+            if not hasattr(self, attr):
+                setattr(self, attr, default)
         if target_wallets is not None:
             self.target_wallets = target_wallets
         if dry_run is not None:
             self.dry_run = bool(dry_run)
             if self.dry_run != previous_dry_run:
                 self._reset_martingale_for_mode_change(previous_dry_run, self.dry_run)
+                self._reset_fair_value_for_mode_change(previous_dry_run, self.dry_run)
         if poll_interval is not None:
             self.poll_interval = poll_interval
         if size_mode is not None:
@@ -3363,6 +7014,7 @@ class CopyTrader:
         if strategy_mode is not None:
             self.strategy_mode = strategy_mode
             self._reset_martingale_for_strategy_change(previous_strategy_mode, self.strategy_mode)
+            self._reset_fair_value_for_strategy_change(previous_strategy_mode, self.strategy_mode)
         if winning_size_mode is not None:
             self.winning_size_mode = winning_size_mode
         if winning_size_value is not None:
@@ -3386,8 +7038,237 @@ class CopyTrader:
             self.martingale_maker_blind_price = min(max(float(martingale_maker_blind_price), 0.40), 0.60)
         if martingale_maker_blind_end_seconds is not None:
             self.martingale_maker_blind_end_seconds = min(max(float(martingale_maker_blind_end_seconds), 0.0), 30.0)
+        if fair_value_stake_usd is not None:
+            self.fair_value_stake_usd = min(max(float(fair_value_stake_usd), 0.01), 1000.0)
+        if fair_value_min_taker_edge is not None:
+            self.fair_value_min_taker_edge = min(max(float(fair_value_min_taker_edge), 0.0), 0.50)
+        if fair_value_min_maker_edge is not None:
+            self.fair_value_min_maker_edge = min(max(float(fair_value_min_maker_edge), 0.0), 0.50)
+        if fair_value_min_ev_per_usd is not None:
+            self.fair_value_min_ev_per_usd = min(max(float(fair_value_min_ev_per_usd), 0.0), 5.0)
+        if fair_value_taker_guard_min_edge is not None:
+            self.fair_value_taker_guard_min_edge = min(max(float(fair_value_taker_guard_min_edge), 0.0), 0.50)
+        if fair_value_taker_guard_min_ev_per_usd is not None:
+            self.fair_value_taker_guard_min_ev_per_usd = min(max(float(fair_value_taker_guard_min_ev_per_usd), 0.0), 5.0)
+        if fair_value_entry_start_seconds is not None:
+            self.fair_value_entry_start_seconds = min(max(float(fair_value_entry_start_seconds), 0.0), 300.0)
+        if fair_value_entry_end_seconds is not None:
+            self.fair_value_entry_end_seconds = min(max(float(fair_value_entry_end_seconds), 1.0), 300.0)
+        if self.fair_value_entry_end_seconds < self.fair_value_entry_start_seconds:
+            self.fair_value_entry_end_seconds = self.fair_value_entry_start_seconds
+        if fair_value_min_price is not None:
+            self.fair_value_min_price = min(max(float(fair_value_min_price), 0.01), 0.99)
+        if fair_value_max_price is not None:
+            self.fair_value_max_price = min(max(float(fair_value_max_price), 0.01), 0.99)
+        if self.fair_value_min_price > self.fair_value_max_price:
+            self.fair_value_min_price, self.fair_value_max_price = self.fair_value_max_price, self.fair_value_min_price
+        if fair_value_core_min_price is not None:
+            self.fair_value_core_min_price = min(max(float(fair_value_core_min_price), 0.01), 0.99)
+        if fair_value_core_max_price is not None:
+            self.fair_value_core_max_price = min(max(float(fair_value_core_max_price), 0.01), 0.99)
+        if self.fair_value_core_min_price > self.fair_value_core_max_price:
+            self.fair_value_core_min_price, self.fair_value_core_max_price = (
+                self.fair_value_core_max_price,
+                self.fair_value_core_min_price,
+            )
+        if fair_value_maker_wait_seconds is not None:
+            self.fair_value_maker_wait_seconds = min(max(float(fair_value_maker_wait_seconds), 0.0), 30.0)
+        if fair_value_sample_seconds is not None:
+            self.fair_value_sample_seconds = min(max(float(fair_value_sample_seconds), 0.1), 10.0)
+        if fair_value_model_sensitivity_bps is not None:
+            self.fair_value_model_sensitivity_bps = min(max(float(fair_value_model_sensitivity_bps), 1.0), 250.0)
+        if fair_value_prefer_maker is not None:
+            self.fair_value_prefer_maker = bool(fair_value_prefer_maker)
+        if fair_value_live_trading_enabled is not None:
+            self.fair_value_live_trading_enabled = bool(fair_value_live_trading_enabled)
+        if fair_value_core_enabled is not None:
+            self.fair_value_core_enabled = bool(fair_value_core_enabled)
+        if fair_value_core_contrarian_only is not None:
+            self.fair_value_core_contrarian_only = bool(fair_value_core_contrarian_only)
+        if fair_value_core_max_entries_per_window is not None:
+            self.fair_value_core_max_entries_per_window = min(
+                max(int(fair_value_core_max_entries_per_window), 0),
+                50,
+            )
+        if fair_value_min_ev_improvement_per_entry is not None:
+            self.fair_value_min_ev_improvement_per_entry = min(
+                max(float(fair_value_min_ev_improvement_per_entry), 0.0),
+                5.0,
+            )
+        if fair_value_momentum_enabled is not None:
+            self.fair_value_momentum_enabled = bool(fair_value_momentum_enabled)
+        if fair_value_momentum_start_seconds is not None:
+            self.fair_value_momentum_start_seconds = min(max(float(fair_value_momentum_start_seconds), 0.0), 300.0)
+        if fair_value_momentum_end_seconds is not None:
+            self.fair_value_momentum_end_seconds = min(max(float(fair_value_momentum_end_seconds), 1.0), 300.0)
+        if self.fair_value_momentum_end_seconds < self.fair_value_momentum_start_seconds:
+            self.fair_value_momentum_end_seconds = self.fair_value_momentum_start_seconds
+        if fair_value_momentum_min_edge is not None:
+            self.fair_value_momentum_min_edge = min(max(float(fair_value_momentum_min_edge), 0.0), 0.50)
+        if fair_value_momentum_min_ev_per_usd is not None:
+            self.fair_value_momentum_min_ev_per_usd = min(max(float(fair_value_momentum_min_ev_per_usd), 0.0), 5.0)
+        if fair_value_momentum_min_confidence is not None:
+            self.fair_value_momentum_min_confidence = min(max(float(fair_value_momentum_min_confidence), 0.0), 1.0)
+        if fair_value_momentum_max_price is not None:
+            self.fair_value_momentum_max_price = min(max(float(fair_value_momentum_max_price), 0.01), 0.99)
+        if fair_value_momentum_stake_multiplier is not None:
+            self.fair_value_momentum_stake_multiplier = min(max(float(fair_value_momentum_stake_multiplier), 0.01), 25.0)
+        if fair_value_momentum_max_entries_per_window is not None:
+            self.fair_value_momentum_max_entries_per_window = min(
+                max(int(fair_value_momentum_max_entries_per_window), 0),
+                50,
+            )
+        if fair_value_momentum_min_ev_improvement_per_entry is not None:
+            self.fair_value_momentum_min_ev_improvement_per_entry = min(
+                max(float(fair_value_momentum_min_ev_improvement_per_entry), 0.0),
+                5.0,
+            )
+        if fair_value_late_continuation_enabled is not None:
+            self.fair_value_late_continuation_enabled = bool(fair_value_late_continuation_enabled)
+        if fair_value_late_continuation_start_seconds is not None:
+            self.fair_value_late_continuation_start_seconds = min(
+                max(float(fair_value_late_continuation_start_seconds), 0.0),
+                300.0,
+            )
+        if fair_value_late_continuation_end_seconds is not None:
+            self.fair_value_late_continuation_end_seconds = min(
+                max(float(fair_value_late_continuation_end_seconds), 1.0),
+                300.0,
+            )
+        if self.fair_value_late_continuation_end_seconds < self.fair_value_late_continuation_start_seconds:
+            self.fair_value_late_continuation_end_seconds = self.fair_value_late_continuation_start_seconds
+        if fair_value_late_continuation_min_abs_delta_bps is not None:
+            self.fair_value_late_continuation_min_abs_delta_bps = min(
+                max(float(fair_value_late_continuation_min_abs_delta_bps), 0.0),
+                250.0,
+            )
+        if fair_value_late_continuation_min_probability is not None:
+            self.fair_value_late_continuation_min_probability = min(
+                max(float(fair_value_late_continuation_min_probability), 0.5),
+                0.999,
+            )
+        if fair_value_late_continuation_max_probability is not None:
+            self.fair_value_late_continuation_max_probability = min(
+                max(float(fair_value_late_continuation_max_probability), 0.5),
+                0.999,
+            )
+        if self.fair_value_late_continuation_min_probability > self.fair_value_late_continuation_max_probability:
+            self.fair_value_late_continuation_min_probability, self.fair_value_late_continuation_max_probability = (
+                self.fair_value_late_continuation_max_probability,
+                self.fair_value_late_continuation_min_probability,
+            )
+        if fair_value_late_continuation_min_ev_per_usd is not None:
+            self.fair_value_late_continuation_min_ev_per_usd = min(
+                max(float(fair_value_late_continuation_min_ev_per_usd), 0.0),
+                5.0,
+            )
+        if fair_value_late_continuation_price_buffer is not None:
+            self.fair_value_late_continuation_price_buffer = min(
+                max(float(fair_value_late_continuation_price_buffer), 0.0),
+                0.25,
+            )
+        if fair_value_late_continuation_max_price is not None:
+            self.fair_value_late_continuation_max_price = min(
+                max(float(fair_value_late_continuation_max_price), 0.01),
+                0.99,
+            )
+        if fair_value_late_continuation_stake_multiplier is not None:
+            self.fair_value_late_continuation_stake_multiplier = min(
+                max(float(fair_value_late_continuation_stake_multiplier), 0.01),
+                25.0,
+            )
+        if fair_value_late_continuation_max_entries_per_window is not None:
+            self.fair_value_late_continuation_max_entries_per_window = min(
+                max(int(fair_value_late_continuation_max_entries_per_window), 0),
+                50,
+            )
+        if fair_value_late_continuation_min_ev_improvement_per_entry is not None:
+            self.fair_value_late_continuation_min_ev_improvement_per_entry = min(
+                max(float(fair_value_late_continuation_min_ev_improvement_per_entry), 0.0),
+                5.0,
+            )
+        if fair_value_late_continuation_entry_model_min_win_prob is not None:
+            self.fair_value_late_continuation_entry_model_min_win_prob = min(
+                max(float(fair_value_late_continuation_entry_model_min_win_prob), 0.0),
+                1.0,
+            )
+        if fair_value_giro_probe_enabled is not None:
+            self.fair_value_giro_probe_enabled = bool(fair_value_giro_probe_enabled)
+        if fair_value_giro_probe_start_seconds is not None:
+            self.fair_value_giro_probe_start_seconds = min(max(float(fair_value_giro_probe_start_seconds), 0.0), 300.0)
+        if fair_value_giro_probe_end_seconds is not None:
+            self.fair_value_giro_probe_end_seconds = min(max(float(fair_value_giro_probe_end_seconds), 1.0), 300.0)
+        if self.fair_value_giro_probe_end_seconds < self.fair_value_giro_probe_start_seconds:
+            self.fair_value_giro_probe_end_seconds = self.fair_value_giro_probe_start_seconds
+        if fair_value_giro_probe_min_price is not None:
+            self.fair_value_giro_probe_min_price = min(max(float(fair_value_giro_probe_min_price), 0.01), 0.99)
+        if fair_value_giro_probe_max_price is not None:
+            self.fair_value_giro_probe_max_price = min(max(float(fair_value_giro_probe_max_price), 0.01), 0.99)
+        if self.fair_value_giro_probe_min_price > self.fair_value_giro_probe_max_price:
+            self.fair_value_giro_probe_min_price, self.fair_value_giro_probe_max_price = (
+                self.fair_value_giro_probe_max_price,
+                self.fair_value_giro_probe_min_price,
+            )
+        if fair_value_giro_probe_min_abs_delta_bps is not None:
+            self.fair_value_giro_probe_min_abs_delta_bps = min(max(float(fair_value_giro_probe_min_abs_delta_bps), 0.0), 250.0)
+        if fair_value_giro_probe_min_probability is not None:
+            self.fair_value_giro_probe_min_probability = min(max(float(fair_value_giro_probe_min_probability), 0.0), 1.0)
+        if fair_value_giro_probe_min_ev_per_usd is not None:
+            self.fair_value_giro_probe_min_ev_per_usd = min(max(float(fair_value_giro_probe_min_ev_per_usd), -1.0), 10.0)
+        if fair_value_giro_probe_min_confidence is not None:
+            self.fair_value_giro_probe_min_confidence = min(max(float(fair_value_giro_probe_min_confidence), 0.0), 1.0)
+        if fair_value_giro_probe_max_entries_per_window is not None:
+            self.fair_value_giro_probe_max_entries_per_window = min(
+                max(int(fair_value_giro_probe_max_entries_per_window), 0),
+                100,
+            )
+        if fair_value_giro_probe_min_price_step is not None:
+            self.fair_value_giro_probe_min_price_step = min(max(float(fair_value_giro_probe_min_price_step), 0.0), 0.50)
+        if fair_value_giro_probe_stake_multiplier is not None:
+            self.fair_value_giro_probe_stake_multiplier = min(max(float(fair_value_giro_probe_stake_multiplier), 0.01), 25.0)
+        if fair_value_entry_model_enabled is not None:
+            self.fair_value_entry_model_enabled = bool(fair_value_entry_model_enabled)
+        if fair_value_core_entry_model_min_win_prob is not None:
+            self.fair_value_core_entry_model_min_win_prob = min(
+                max(float(fair_value_core_entry_model_min_win_prob), 0.0),
+                1.0,
+            )
+        if fair_value_core_entry_model_max_win_prob is not None:
+            self.fair_value_core_entry_model_max_win_prob = min(
+                max(float(fair_value_core_entry_model_max_win_prob), 0.0),
+                1.0,
+            )
+        if self.fair_value_core_entry_model_min_win_prob > self.fair_value_core_entry_model_max_win_prob:
+            self.fair_value_core_entry_model_min_win_prob, self.fair_value_core_entry_model_max_win_prob = (
+                self.fair_value_core_entry_model_max_win_prob,
+                self.fair_value_core_entry_model_min_win_prob,
+            )
+        if fair_value_momentum_entry_model_min_win_prob is not None:
+            self.fair_value_momentum_entry_model_min_win_prob = min(
+                max(float(fair_value_momentum_entry_model_min_win_prob), 0.0),
+                1.0,
+            )
+        if fair_value_shadow_dynamic_stake_enabled is not None:
+            self.fair_value_shadow_dynamic_stake_enabled = bool(fair_value_shadow_dynamic_stake_enabled)
+        if fair_value_shadow_dynamic_stake_min_multiplier is not None:
+            self.fair_value_shadow_dynamic_stake_min_multiplier = float(fair_value_shadow_dynamic_stake_min_multiplier)
+        if fair_value_shadow_dynamic_stake_max_multiplier is not None:
+            self.fair_value_shadow_dynamic_stake_max_multiplier = float(fair_value_shadow_dynamic_stake_max_multiplier)
+        self.fair_value_shadow_dynamic_stake_min_multiplier = min(
+            max(float(self.fair_value_shadow_dynamic_stake_min_multiplier), 0.01),
+            10.0,
+        )
+        self.fair_value_shadow_dynamic_stake_max_multiplier = min(
+            max(float(self.fair_value_shadow_dynamic_stake_max_multiplier), self.fair_value_shadow_dynamic_stake_min_multiplier),
+            10.0,
+        )
             
-        self.log(f"Config Updated: Strat={self.strategy_mode}, Targets={len(self.target_wallets)}, DryRun={self.dry_run}, Interval={self.poll_interval}, WinSize={self.winning_size_value} ({self.winning_size_mode}), Martingale={self.martingale_initial_amount}")
+        self.log(
+            f"Config Updated: Strat={self.strategy_mode}, Targets={len(self.target_wallets)}, "
+            f"DryRun={self.dry_run}, Interval={self.poll_interval}, "
+            f"WinSize={self.winning_size_value} ({self.winning_size_mode}), "
+            f"Martingale={self.martingale_initial_amount}, FairValue=${self.fair_value_stake_usd:.2f}"
+        )
         
         # Save to history
         from datetime import datetime
@@ -3419,7 +7300,70 @@ class CopyTrader:
             "martingale_maker_sample_seconds": self.martingale_maker_sample_seconds,
             "martingale_maker_record_seconds": self.martingale_maker_record_seconds,
             "martingale_maker_blind_price": self.martingale_maker_blind_price,
-            "martingale_maker_blind_end_seconds": self.martingale_maker_blind_end_seconds
+            "martingale_maker_blind_end_seconds": self.martingale_maker_blind_end_seconds,
+            "fair_value_stake_usd": self.fair_value_stake_usd,
+            "fair_value_min_taker_edge": self.fair_value_min_taker_edge,
+            "fair_value_min_maker_edge": self.fair_value_min_maker_edge,
+            "fair_value_entry_start_seconds": self.fair_value_entry_start_seconds,
+            "fair_value_entry_end_seconds": self.fair_value_entry_end_seconds,
+            "fair_value_min_ev_per_usd": self.fair_value_min_ev_per_usd,
+            "fair_value_taker_guard_min_edge": self.fair_value_taker_guard_min_edge,
+            "fair_value_taker_guard_min_ev_per_usd": self.fair_value_taker_guard_min_ev_per_usd,
+            "fair_value_min_price": self.fair_value_min_price,
+            "fair_value_max_price": self.fair_value_max_price,
+            "fair_value_core_min_price": self.fair_value_core_min_price,
+            "fair_value_core_max_price": self.fair_value_core_max_price,
+            "fair_value_maker_wait_seconds": self.fair_value_maker_wait_seconds,
+            "fair_value_sample_seconds": self.fair_value_sample_seconds,
+            "fair_value_model_sensitivity_bps": self.fair_value_model_sensitivity_bps,
+            "fair_value_prefer_maker": self.fair_value_prefer_maker,
+            "fair_value_live_trading_enabled": self.fair_value_live_trading_enabled,
+            "fair_value_core_enabled": self.fair_value_core_enabled,
+            "fair_value_core_contrarian_only": self.fair_value_core_contrarian_only,
+            "fair_value_core_max_entries_per_window": self.fair_value_core_max_entries_per_window,
+            "fair_value_min_ev_improvement_per_entry": self.fair_value_min_ev_improvement_per_entry,
+            "fair_value_momentum_enabled": self.fair_value_momentum_enabled,
+            "fair_value_momentum_start_seconds": self.fair_value_momentum_start_seconds,
+            "fair_value_momentum_end_seconds": self.fair_value_momentum_end_seconds,
+            "fair_value_momentum_min_edge": self.fair_value_momentum_min_edge,
+            "fair_value_momentum_min_ev_per_usd": self.fair_value_momentum_min_ev_per_usd,
+            "fair_value_momentum_min_confidence": self.fair_value_momentum_min_confidence,
+            "fair_value_momentum_max_price": self.fair_value_momentum_max_price,
+            "fair_value_momentum_stake_multiplier": self.fair_value_momentum_stake_multiplier,
+            "fair_value_momentum_max_entries_per_window": self.fair_value_momentum_max_entries_per_window,
+            "fair_value_momentum_min_ev_improvement_per_entry": self.fair_value_momentum_min_ev_improvement_per_entry,
+            "fair_value_late_continuation_enabled": self.fair_value_late_continuation_enabled,
+            "fair_value_late_continuation_start_seconds": self.fair_value_late_continuation_start_seconds,
+            "fair_value_late_continuation_end_seconds": self.fair_value_late_continuation_end_seconds,
+            "fair_value_late_continuation_min_abs_delta_bps": self.fair_value_late_continuation_min_abs_delta_bps,
+            "fair_value_late_continuation_min_probability": self.fair_value_late_continuation_min_probability,
+            "fair_value_late_continuation_max_probability": self.fair_value_late_continuation_max_probability,
+            "fair_value_late_continuation_min_ev_per_usd": self.fair_value_late_continuation_min_ev_per_usd,
+            "fair_value_late_continuation_price_buffer": self.fair_value_late_continuation_price_buffer,
+            "fair_value_late_continuation_max_price": self.fair_value_late_continuation_max_price,
+            "fair_value_late_continuation_stake_multiplier": self.fair_value_late_continuation_stake_multiplier,
+            "fair_value_late_continuation_max_entries_per_window": self.fair_value_late_continuation_max_entries_per_window,
+            "fair_value_late_continuation_min_ev_improvement_per_entry": self.fair_value_late_continuation_min_ev_improvement_per_entry,
+            "fair_value_late_continuation_entry_model_min_win_prob": self.fair_value_late_continuation_entry_model_min_win_prob,
+            "fair_value_giro_probe_enabled": self.fair_value_giro_probe_enabled,
+            "fair_value_giro_probe_start_seconds": self.fair_value_giro_probe_start_seconds,
+            "fair_value_giro_probe_end_seconds": self.fair_value_giro_probe_end_seconds,
+            "fair_value_giro_probe_min_price": self.fair_value_giro_probe_min_price,
+            "fair_value_giro_probe_max_price": self.fair_value_giro_probe_max_price,
+            "fair_value_giro_probe_min_abs_delta_bps": self.fair_value_giro_probe_min_abs_delta_bps,
+            "fair_value_giro_probe_min_probability": self.fair_value_giro_probe_min_probability,
+            "fair_value_giro_probe_min_ev_per_usd": self.fair_value_giro_probe_min_ev_per_usd,
+            "fair_value_giro_probe_min_confidence": self.fair_value_giro_probe_min_confidence,
+            "fair_value_giro_probe_max_entries_per_window": self.fair_value_giro_probe_max_entries_per_window,
+            "fair_value_giro_probe_min_price_step": self.fair_value_giro_probe_min_price_step,
+            "fair_value_giro_probe_stake_multiplier": self.fair_value_giro_probe_stake_multiplier,
+            "fair_value_entry_model_enabled": self.fair_value_entry_model_enabled,
+            "fair_value_core_entry_model_min_win_prob": self.fair_value_core_entry_model_min_win_prob,
+            "fair_value_core_entry_model_max_win_prob": self.fair_value_core_entry_model_max_win_prob,
+            "fair_value_momentum_entry_model_min_win_prob": self.fair_value_momentum_entry_model_min_win_prob,
+            "fair_value_shadow_dynamic_stake_enabled": self.fair_value_shadow_dynamic_stake_enabled,
+            "fair_value_shadow_dynamic_stake_min_multiplier": self.fair_value_shadow_dynamic_stake_min_multiplier,
+            "fair_value_shadow_dynamic_stake_max_multiplier": self.fair_value_shadow_dynamic_stake_max_multiplier,
         }
         # Prepend to history (newest first)
         self.history.insert(0, entry)

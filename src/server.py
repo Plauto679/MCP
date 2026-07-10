@@ -29,6 +29,21 @@ CHAIN_ID = 137  # Polygon
 # Initialize Server
 mcp = FastMCP("Polymarket MCP")
 
+
+def _clob_health_detail() -> str:
+    try:
+        with httpx.Client(http2=False, timeout=httpx.Timeout(5.0, connect=3.0)) as client:
+            resp = client.get(f"{HOST}/ok")
+        return f"GET /ok status={resp.status_code} body={resp.text[:80]}"
+    except Exception as exc:
+        return f"GET /ok failed: {type(exc).__name__}: {exc}"
+
+
+def _append_connectivity_detail(error_msg: str) -> str:
+    if "Request exception" not in str(error_msg):
+        return str(error_msg)
+    return f"{error_msg} | CLOB connectivity: {_clob_health_detail()}"
+
 def _resolve_signature_type(proxy_address: str | None) -> int:
     """
     Resolve signature type with sane defaults:
@@ -225,7 +240,7 @@ def place_order(
         elif "order_version_mismatch" in error_msg:
             return "Error: order_version_mismatch — check that py-clob-client-v2 is installed correctly."
         else:
-            return f"Error placing order: {error_msg}"
+            return f"Error placing order: {_append_connectivity_detail(error_msg)}"
 
 @mcp.tool()
 def place_market_order(
@@ -301,7 +316,7 @@ def place_market_order(
                 f"Signer={signer_address}, Proxy={proxy_address or 'N/A'}, SignatureType={sig_type}."
             )
         else:
-            return f"Error placing market order: {error_msg}"
+            return f"Error placing market order: {_append_connectivity_detail(error_msg)}"
 
 @mcp.tool()
 def get_order(order_id: str):

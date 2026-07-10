@@ -7,6 +7,7 @@ from typing import Optional
 import asyncio
 import os
 from .orchestrator import CopyTrader
+from .performance import build_performance_snapshot
 
 app = FastAPI(title="Polymarket Copy Trader Dashboard")
 try:
@@ -33,7 +34,7 @@ class ConfigUpdate(BaseModel):
     winning_price_threshold: float = 0.75
     winning_entry_time: float = 3.0
     winning_exit_time: float = 4.5
-    strategy_mode: str = "copy" # 'copy', 'winning', 'martingale', or 'martingale_maker'
+    strategy_mode: str = "copy" # 'copy', 'winning', 'martingale', 'martingale_maker', or 'fair_value'
     winning_size_mode: str = "fixed" # 'fixed' or 'percent'
     winning_size_value: float = 10.0
     martingale_initial_amount: float = 5.0
@@ -44,6 +45,69 @@ class ConfigUpdate(BaseModel):
     martingale_maker_record_seconds: float = 15.0
     martingale_maker_blind_price: float = 0.50
     martingale_maker_blind_end_seconds: float = 15.0
+    fair_value_stake_usd: float = 1.0
+    fair_value_min_taker_edge: float = 0.10
+    fair_value_min_maker_edge: float = 0.10
+    fair_value_min_ev_per_usd: float = 0.30
+    fair_value_taker_guard_min_edge: float = 0.06
+    fair_value_taker_guard_min_ev_per_usd: float = 0.12
+    fair_value_entry_start_seconds: float = 0.0
+    fair_value_entry_end_seconds: float = 240.0
+    fair_value_min_price: float = 0.35
+    fair_value_max_price: float = 0.50
+    fair_value_core_min_price: float = 0.46
+    fair_value_core_max_price: float = 0.50
+    fair_value_maker_wait_seconds: float = 3.0
+    fair_value_sample_seconds: float = 1.0
+    fair_value_model_sensitivity_bps: float = 28.0
+    fair_value_prefer_maker: bool = True
+    fair_value_live_trading_enabled: bool = False
+    fair_value_core_enabled: bool = True
+    fair_value_core_contrarian_only: bool = True
+    fair_value_core_max_entries_per_window: int = 2
+    fair_value_min_ev_improvement_per_entry: float = 0.03
+    fair_value_momentum_enabled: bool = True
+    fair_value_momentum_start_seconds: float = 240.0
+    fair_value_momentum_end_seconds: float = 300.0
+    fair_value_momentum_min_edge: float = 0.02
+    fair_value_momentum_min_ev_per_usd: float = 0.07
+    fair_value_momentum_min_confidence: float = 0.08
+    fair_value_momentum_max_price: float = 0.90
+    fair_value_momentum_stake_multiplier: float = 1.0
+    fair_value_momentum_max_entries_per_window: int = 2
+    fair_value_momentum_min_ev_improvement_per_entry: float = 0.04
+    fair_value_late_continuation_enabled: bool = True
+    fair_value_late_continuation_start_seconds: float = 250.0
+    fair_value_late_continuation_end_seconds: float = 300.0
+    fair_value_late_continuation_min_abs_delta_bps: float = 5.0
+    fair_value_late_continuation_min_probability: float = 0.87
+    fair_value_late_continuation_max_probability: float = 0.95
+    fair_value_late_continuation_min_ev_per_usd: float = 0.015
+    fair_value_late_continuation_price_buffer: float = 0.01
+    fair_value_late_continuation_max_price: float = 0.95
+    fair_value_late_continuation_stake_multiplier: float = 1.0
+    fair_value_late_continuation_max_entries_per_window: int = 2
+    fair_value_late_continuation_min_ev_improvement_per_entry: float = 0.03
+    fair_value_late_continuation_entry_model_min_win_prob: float = 0.0
+    fair_value_giro_probe_enabled: bool = True
+    fair_value_giro_probe_start_seconds: float = 0.0
+    fair_value_giro_probe_end_seconds: float = 300.0
+    fair_value_giro_probe_min_price: float = 0.15
+    fair_value_giro_probe_max_price: float = 0.42
+    fair_value_giro_probe_min_abs_delta_bps: float = 0.5
+    fair_value_giro_probe_min_probability: float = 0.45
+    fair_value_giro_probe_min_ev_per_usd: float = 0.05
+    fair_value_giro_probe_min_confidence: float = 0.10
+    fair_value_giro_probe_max_entries_per_window: int = 2
+    fair_value_giro_probe_min_price_step: float = 0.03
+    fair_value_giro_probe_stake_multiplier: float = 1.0
+    fair_value_entry_model_enabled: bool = True
+    fair_value_core_entry_model_min_win_prob: float = 0.47
+    fair_value_core_entry_model_max_win_prob: float = 0.53
+    fair_value_momentum_entry_model_min_win_prob: float = 0.63
+    fair_value_shadow_dynamic_stake_enabled: bool = True
+    fair_value_shadow_dynamic_stake_min_multiplier: float = 1.0
+    fair_value_shadow_dynamic_stake_max_multiplier: float = 2.0
 
 class StartRequest(BaseModel):
     duration: Optional[int] = None
@@ -76,6 +140,69 @@ async def read_root(request: Request):
         "martingale_maker_record_seconds": getattr(trader, "martingale_maker_record_seconds", 15.0),
         "martingale_maker_blind_price": getattr(trader, "martingale_maker_blind_price", 0.50),
         "martingale_maker_blind_end_seconds": getattr(trader, "martingale_maker_blind_end_seconds", 15.0),
+        "fair_value_stake_usd": getattr(trader, "fair_value_stake_usd", 1.0),
+        "fair_value_min_taker_edge": getattr(trader, "fair_value_min_taker_edge", 0.10),
+        "fair_value_min_maker_edge": getattr(trader, "fair_value_min_maker_edge", 0.10),
+        "fair_value_min_ev_per_usd": getattr(trader, "fair_value_min_ev_per_usd", 0.30),
+        "fair_value_taker_guard_min_edge": getattr(trader, "fair_value_taker_guard_min_edge", 0.06),
+        "fair_value_taker_guard_min_ev_per_usd": getattr(trader, "fair_value_taker_guard_min_ev_per_usd", 0.12),
+        "fair_value_entry_start_seconds": getattr(trader, "fair_value_entry_start_seconds", 0.0),
+        "fair_value_entry_end_seconds": getattr(trader, "fair_value_entry_end_seconds", 240.0),
+        "fair_value_min_price": getattr(trader, "fair_value_min_price", 0.35),
+        "fair_value_max_price": getattr(trader, "fair_value_max_price", 0.50),
+        "fair_value_core_min_price": getattr(trader, "fair_value_core_min_price", 0.46),
+        "fair_value_core_max_price": getattr(trader, "fair_value_core_max_price", 0.50),
+        "fair_value_maker_wait_seconds": getattr(trader, "fair_value_maker_wait_seconds", 3.0),
+        "fair_value_sample_seconds": getattr(trader, "fair_value_sample_seconds", 1.0),
+        "fair_value_model_sensitivity_bps": getattr(trader, "fair_value_model_sensitivity_bps", 28.0),
+        "fair_value_prefer_maker": getattr(trader, "fair_value_prefer_maker", True),
+        "fair_value_live_trading_enabled": getattr(trader, "fair_value_live_trading_enabled", False),
+        "fair_value_core_enabled": getattr(trader, "fair_value_core_enabled", True),
+        "fair_value_core_contrarian_only": getattr(trader, "fair_value_core_contrarian_only", False),
+        "fair_value_core_max_entries_per_window": getattr(trader, "fair_value_core_max_entries_per_window", 2),
+        "fair_value_min_ev_improvement_per_entry": getattr(trader, "fair_value_min_ev_improvement_per_entry", 0.03),
+        "fair_value_momentum_enabled": getattr(trader, "fair_value_momentum_enabled", True),
+        "fair_value_momentum_start_seconds": getattr(trader, "fair_value_momentum_start_seconds", 240.0),
+        "fair_value_momentum_end_seconds": getattr(trader, "fair_value_momentum_end_seconds", 300.0),
+        "fair_value_momentum_min_edge": getattr(trader, "fair_value_momentum_min_edge", 0.03),
+        "fair_value_momentum_min_ev_per_usd": getattr(trader, "fair_value_momentum_min_ev_per_usd", 0.12),
+        "fair_value_momentum_min_confidence": getattr(trader, "fair_value_momentum_min_confidence", 0.10),
+        "fair_value_momentum_max_price": getattr(trader, "fair_value_momentum_max_price", 0.90),
+        "fair_value_momentum_stake_multiplier": getattr(trader, "fair_value_momentum_stake_multiplier", 1.0),
+        "fair_value_momentum_max_entries_per_window": getattr(trader, "fair_value_momentum_max_entries_per_window", 2),
+        "fair_value_momentum_min_ev_improvement_per_entry": getattr(trader, "fair_value_momentum_min_ev_improvement_per_entry", 0.04),
+        "fair_value_late_continuation_enabled": getattr(trader, "fair_value_late_continuation_enabled", True),
+        "fair_value_late_continuation_start_seconds": getattr(trader, "fair_value_late_continuation_start_seconds", 250.0),
+        "fair_value_late_continuation_end_seconds": getattr(trader, "fair_value_late_continuation_end_seconds", 300.0),
+        "fair_value_late_continuation_min_abs_delta_bps": getattr(trader, "fair_value_late_continuation_min_abs_delta_bps", 5.0),
+        "fair_value_late_continuation_min_probability": getattr(trader, "fair_value_late_continuation_min_probability", 0.87),
+        "fair_value_late_continuation_max_probability": getattr(trader, "fair_value_late_continuation_max_probability", 0.95),
+        "fair_value_late_continuation_min_ev_per_usd": getattr(trader, "fair_value_late_continuation_min_ev_per_usd", 0.015),
+        "fair_value_late_continuation_price_buffer": getattr(trader, "fair_value_late_continuation_price_buffer", 0.01),
+        "fair_value_late_continuation_max_price": getattr(trader, "fair_value_late_continuation_max_price", 0.95),
+        "fair_value_late_continuation_stake_multiplier": getattr(trader, "fair_value_late_continuation_stake_multiplier", 1.0),
+        "fair_value_late_continuation_max_entries_per_window": getattr(trader, "fair_value_late_continuation_max_entries_per_window", 2),
+        "fair_value_late_continuation_min_ev_improvement_per_entry": getattr(trader, "fair_value_late_continuation_min_ev_improvement_per_entry", 0.03),
+        "fair_value_late_continuation_entry_model_min_win_prob": getattr(trader, "fair_value_late_continuation_entry_model_min_win_prob", 0.0),
+        "fair_value_giro_probe_enabled": getattr(trader, "fair_value_giro_probe_enabled", True),
+        "fair_value_giro_probe_start_seconds": getattr(trader, "fair_value_giro_probe_start_seconds", 0.0),
+        "fair_value_giro_probe_end_seconds": getattr(trader, "fair_value_giro_probe_end_seconds", 300.0),
+        "fair_value_giro_probe_min_price": getattr(trader, "fair_value_giro_probe_min_price", 0.15),
+        "fair_value_giro_probe_max_price": getattr(trader, "fair_value_giro_probe_max_price", 0.42),
+        "fair_value_giro_probe_min_abs_delta_bps": getattr(trader, "fair_value_giro_probe_min_abs_delta_bps", 0.5),
+        "fair_value_giro_probe_min_probability": getattr(trader, "fair_value_giro_probe_min_probability", 0.45),
+        "fair_value_giro_probe_min_ev_per_usd": getattr(trader, "fair_value_giro_probe_min_ev_per_usd", 0.05),
+        "fair_value_giro_probe_min_confidence": getattr(trader, "fair_value_giro_probe_min_confidence", 0.10),
+        "fair_value_giro_probe_max_entries_per_window": getattr(trader, "fair_value_giro_probe_max_entries_per_window", 2),
+        "fair_value_giro_probe_min_price_step": getattr(trader, "fair_value_giro_probe_min_price_step", 0.03),
+        "fair_value_giro_probe_stake_multiplier": getattr(trader, "fair_value_giro_probe_stake_multiplier", 1.0),
+        "fair_value_entry_model_enabled": getattr(trader, "fair_value_entry_model_enabled", True),
+        "fair_value_core_entry_model_min_win_prob": getattr(trader, "fair_value_core_entry_model_min_win_prob", 0.47),
+        "fair_value_core_entry_model_max_win_prob": getattr(trader, "fair_value_core_entry_model_max_win_prob", 0.53),
+        "fair_value_momentum_entry_model_min_win_prob": getattr(trader, "fair_value_momentum_entry_model_min_win_prob", 0.63),
+        "fair_value_shadow_dynamic_stake_enabled": getattr(trader, "fair_value_shadow_dynamic_stake_enabled", True),
+        "fair_value_shadow_dynamic_stake_min_multiplier": getattr(trader, "fair_value_shadow_dynamic_stake_min_multiplier", 1.0),
+        "fair_value_shadow_dynamic_stake_max_multiplier": getattr(trader, "fair_value_shadow_dynamic_stake_max_multiplier", 2.0),
         "running": trader.running
     })
 
@@ -116,7 +243,70 @@ async def update_config(config: ConfigUpdate):
         martingale_maker_sample_seconds=config.martingale_maker_sample_seconds,
         martingale_maker_record_seconds=config.martingale_maker_record_seconds,
         martingale_maker_blind_price=config.martingale_maker_blind_price,
-        martingale_maker_blind_end_seconds=config.martingale_maker_blind_end_seconds
+        martingale_maker_blind_end_seconds=config.martingale_maker_blind_end_seconds,
+        fair_value_stake_usd=config.fair_value_stake_usd,
+        fair_value_min_taker_edge=config.fair_value_min_taker_edge,
+        fair_value_min_maker_edge=config.fair_value_min_maker_edge,
+        fair_value_min_ev_per_usd=config.fair_value_min_ev_per_usd,
+        fair_value_taker_guard_min_edge=config.fair_value_taker_guard_min_edge,
+        fair_value_taker_guard_min_ev_per_usd=config.fair_value_taker_guard_min_ev_per_usd,
+        fair_value_entry_start_seconds=config.fair_value_entry_start_seconds,
+        fair_value_entry_end_seconds=config.fair_value_entry_end_seconds,
+        fair_value_min_price=config.fair_value_min_price,
+        fair_value_max_price=config.fair_value_max_price,
+        fair_value_core_min_price=config.fair_value_core_min_price,
+        fair_value_core_max_price=config.fair_value_core_max_price,
+        fair_value_maker_wait_seconds=config.fair_value_maker_wait_seconds,
+        fair_value_sample_seconds=config.fair_value_sample_seconds,
+        fair_value_model_sensitivity_bps=config.fair_value_model_sensitivity_bps,
+        fair_value_prefer_maker=config.fair_value_prefer_maker,
+        fair_value_live_trading_enabled=config.fair_value_live_trading_enabled,
+        fair_value_core_enabled=config.fair_value_core_enabled,
+        fair_value_core_contrarian_only=config.fair_value_core_contrarian_only,
+        fair_value_core_max_entries_per_window=config.fair_value_core_max_entries_per_window,
+        fair_value_min_ev_improvement_per_entry=config.fair_value_min_ev_improvement_per_entry,
+        fair_value_momentum_enabled=config.fair_value_momentum_enabled,
+        fair_value_momentum_start_seconds=config.fair_value_momentum_start_seconds,
+        fair_value_momentum_end_seconds=config.fair_value_momentum_end_seconds,
+        fair_value_momentum_min_edge=config.fair_value_momentum_min_edge,
+        fair_value_momentum_min_ev_per_usd=config.fair_value_momentum_min_ev_per_usd,
+        fair_value_momentum_min_confidence=config.fair_value_momentum_min_confidence,
+        fair_value_momentum_max_price=config.fair_value_momentum_max_price,
+        fair_value_momentum_stake_multiplier=config.fair_value_momentum_stake_multiplier,
+        fair_value_momentum_max_entries_per_window=config.fair_value_momentum_max_entries_per_window,
+        fair_value_momentum_min_ev_improvement_per_entry=config.fair_value_momentum_min_ev_improvement_per_entry,
+        fair_value_late_continuation_enabled=config.fair_value_late_continuation_enabled,
+        fair_value_late_continuation_start_seconds=config.fair_value_late_continuation_start_seconds,
+        fair_value_late_continuation_end_seconds=config.fair_value_late_continuation_end_seconds,
+        fair_value_late_continuation_min_abs_delta_bps=config.fair_value_late_continuation_min_abs_delta_bps,
+        fair_value_late_continuation_min_probability=config.fair_value_late_continuation_min_probability,
+        fair_value_late_continuation_max_probability=config.fair_value_late_continuation_max_probability,
+        fair_value_late_continuation_min_ev_per_usd=config.fair_value_late_continuation_min_ev_per_usd,
+        fair_value_late_continuation_price_buffer=config.fair_value_late_continuation_price_buffer,
+        fair_value_late_continuation_max_price=config.fair_value_late_continuation_max_price,
+        fair_value_late_continuation_stake_multiplier=config.fair_value_late_continuation_stake_multiplier,
+        fair_value_late_continuation_max_entries_per_window=config.fair_value_late_continuation_max_entries_per_window,
+        fair_value_late_continuation_min_ev_improvement_per_entry=config.fair_value_late_continuation_min_ev_improvement_per_entry,
+        fair_value_late_continuation_entry_model_min_win_prob=config.fair_value_late_continuation_entry_model_min_win_prob,
+        fair_value_giro_probe_enabled=config.fair_value_giro_probe_enabled,
+        fair_value_giro_probe_start_seconds=config.fair_value_giro_probe_start_seconds,
+        fair_value_giro_probe_end_seconds=config.fair_value_giro_probe_end_seconds,
+        fair_value_giro_probe_min_price=config.fair_value_giro_probe_min_price,
+        fair_value_giro_probe_max_price=config.fair_value_giro_probe_max_price,
+        fair_value_giro_probe_min_abs_delta_bps=config.fair_value_giro_probe_min_abs_delta_bps,
+        fair_value_giro_probe_min_probability=config.fair_value_giro_probe_min_probability,
+        fair_value_giro_probe_min_ev_per_usd=config.fair_value_giro_probe_min_ev_per_usd,
+        fair_value_giro_probe_min_confidence=config.fair_value_giro_probe_min_confidence,
+        fair_value_giro_probe_max_entries_per_window=config.fair_value_giro_probe_max_entries_per_window,
+        fair_value_giro_probe_min_price_step=config.fair_value_giro_probe_min_price_step,
+        fair_value_giro_probe_stake_multiplier=config.fair_value_giro_probe_stake_multiplier,
+        fair_value_entry_model_enabled=config.fair_value_entry_model_enabled,
+        fair_value_core_entry_model_min_win_prob=config.fair_value_core_entry_model_min_win_prob,
+        fair_value_core_entry_model_max_win_prob=config.fair_value_core_entry_model_max_win_prob,
+        fair_value_momentum_entry_model_min_win_prob=config.fair_value_momentum_entry_model_min_win_prob,
+        fair_value_shadow_dynamic_stake_enabled=config.fair_value_shadow_dynamic_stake_enabled,
+        fair_value_shadow_dynamic_stake_min_multiplier=config.fair_value_shadow_dynamic_stake_min_multiplier,
+        fair_value_shadow_dynamic_stake_max_multiplier=config.fair_value_shadow_dynamic_stake_max_multiplier,
     )
     # Restart if running to apply new interval effectively in the loop
     if trader.running:
@@ -136,6 +326,10 @@ async def get_logs():
 @app.get("/api/history")
 async def get_history():
     return {"history": trader.history}
+
+@app.get("/api/performance")
+async def get_performance():
+    return build_performance_snapshot(trader)
 
 @app.websocket("/ws/logs")
 async def websocket_endpoint(websocket: WebSocket):
