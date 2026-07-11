@@ -15,7 +15,11 @@ param(
     [int]$PaperEveryCycles = 1,
     [int]$AnalysisEveryCycles = 3,
     [double]$MaxSnapshotAgeHours = 24.0,
-    [double]$MaxHistoryMb = 128.0
+    [double]$MaxHistoryMb = 128.0,
+    [string]$ShadowActiveOutputDir = "data\shadow_paper_trader_active_live",
+    [string]$ShadowHoldOutputDir = "data\shadow_paper_trader_hold_live",
+    [string]$ShadowTakerActiveOutputDir = "data\shadow_paper_trader_taker_active_live",
+    [string]$ShadowTakerHoldOutputDir = "data\shadow_paper_trader_taker_hold_live"
 )
 
 $ErrorActionPreference = "Continue"
@@ -111,7 +115,10 @@ function Write-Heartbeat {
             external_fair_value_history = "data\external_fair_value\candidate_history.csv"
             maker_paper_report = "data\market_making_paper_live\report.json"
             evaluator_report = "data\reward_fair_value_evaluator_live\report.json"
-            shadow_paper_report = "data\shadow_paper_trader_live\report.json"
+            shadow_paper_active_report = "$ShadowActiveOutputDir\report.json"
+            shadow_paper_hold_report = "$ShadowHoldOutputDir\report.json"
+            shadow_paper_taker_active_report = "$ShadowTakerActiveOutputDir\report.json"
+            shadow_paper_taker_hold_report = "$ShadowTakerHoldOutputDir\report.json"
             shadow_action_history = "data\reward_fair_value_evaluator_live\shadow_action_history.csv"
             supervisor_log = "data\$RunName\supervisor.log"
         }
@@ -134,8 +141,14 @@ while ($true) {
     Rotate-IfLarge -Path "data\external_fair_value\candidate_history.csv" -MaxMb $MaxHistoryMb
     Rotate-IfLarge -Path "data\external_fair_value\scan_log.jsonl" -MaxMb $MaxHistoryMb
     Rotate-IfLarge -Path "data\reward_fair_value_evaluator_live\shadow_action_history.csv" -MaxMb $MaxHistoryMb
-    Rotate-IfLarge -Path "data\shadow_paper_trader_live\paper_orders.csv" -MaxMb $MaxHistoryMb
-    Rotate-IfLarge -Path "data\shadow_paper_trader_live\paper_order_events.csv" -MaxMb $MaxHistoryMb
+    Rotate-IfLarge -Path "$ShadowActiveOutputDir\paper_orders.csv" -MaxMb $MaxHistoryMb
+    Rotate-IfLarge -Path "$ShadowActiveOutputDir\paper_order_events.csv" -MaxMb $MaxHistoryMb
+    Rotate-IfLarge -Path "$ShadowHoldOutputDir\paper_orders.csv" -MaxMb $MaxHistoryMb
+    Rotate-IfLarge -Path "$ShadowHoldOutputDir\paper_order_events.csv" -MaxMb $MaxHistoryMb
+    Rotate-IfLarge -Path "$ShadowTakerActiveOutputDir\paper_orders.csv" -MaxMb $MaxHistoryMb
+    Rotate-IfLarge -Path "$ShadowTakerActiveOutputDir\paper_order_events.csv" -MaxMb $MaxHistoryMb
+    Rotate-IfLarge -Path "$ShadowTakerHoldOutputDir\paper_orders.csv" -MaxMb $MaxHistoryMb
+    Rotate-IfLarge -Path "$ShadowTakerHoldOutputDir\paper_order_events.csv" -MaxMb $MaxHistoryMb
     Rotate-IfLarge -Path $SupervisorLog -MaxMb 32.0
 
     $rewardArgs = @(
@@ -187,9 +200,45 @@ while ($true) {
         "research\shadow_paper_trader.py",
         "--shadow-actions-csv", "data\reward_fair_value_evaluator_live\shadow_actions.csv",
         "--maker-history-csv", "data\market_making\candidate_history.csv",
-        "--output-dir", "data\shadow_paper_trader_live"
+        "--output-dir", "$ShadowActiveOutputDir"
     )
-    $exitCodes["shadow_paper_trader"] = Invoke-Step -Name "shadow_paper_trader" -Arguments $shadowPaperArgs
+    $exitCodes["shadow_paper_trader_active"] = Invoke-Step -Name "shadow_paper_trader_active" -Arguments $shadowPaperArgs
+
+    $shadowHoldArgs = @(
+        "research\shadow_paper_trader.py",
+        "--shadow-actions-csv", "data\reward_fair_value_evaluator_live\shadow_actions.csv",
+        "--maker-history-csv", "data\market_making\candidate_history.csv",
+        "--output-dir", "$ShadowHoldOutputDir",
+        "--take-profit-per-share", "999",
+        "--stop-loss-per-share", "999",
+        "--max-position-cycles", "1000000",
+        "--max-position-without-update-hours", "999999",
+        "--disable-stale-position-close"
+    )
+    $exitCodes["shadow_paper_trader_hold"] = Invoke-Step -Name "shadow_paper_trader_hold" -Arguments $shadowHoldArgs
+
+    $shadowTakerActiveArgs = @(
+        "research\shadow_paper_trader.py",
+        "--shadow-actions-csv", "data\reward_fair_value_evaluator_live\shadow_actions.csv",
+        "--maker-history-csv", "data\market_making\candidate_history.csv",
+        "--output-dir", "$ShadowTakerActiveOutputDir",
+        "--directional-entry-mode", "taker"
+    )
+    $exitCodes["shadow_paper_trader_taker_active"] = Invoke-Step -Name "shadow_paper_trader_taker_active" -Arguments $shadowTakerActiveArgs
+
+    $shadowTakerHoldArgs = @(
+        "research\shadow_paper_trader.py",
+        "--shadow-actions-csv", "data\reward_fair_value_evaluator_live\shadow_actions.csv",
+        "--maker-history-csv", "data\market_making\candidate_history.csv",
+        "--output-dir", "$ShadowTakerHoldOutputDir",
+        "--directional-entry-mode", "taker",
+        "--take-profit-per-share", "999",
+        "--stop-loss-per-share", "999",
+        "--max-position-cycles", "1000000",
+        "--max-position-without-update-hours", "999999",
+        "--disable-stale-position-close"
+    )
+    $exitCodes["shadow_paper_trader_taker_hold"] = Invoke-Step -Name "shadow_paper_trader_taker_hold" -Arguments $shadowTakerHoldArgs
 
     if ($AnalysisEveryCycles -gt 0 -and (($cycle % $AnalysisEveryCycles) -eq 0)) {
         $analysisArgs = @(

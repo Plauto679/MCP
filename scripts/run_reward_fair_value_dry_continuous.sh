@@ -23,6 +23,10 @@ PUBLISH_GIT="${PUBLISH_GIT:-0}"
 PUBLISH_REMOTE="${PUBLISH_REMOTE:-origin}"
 PUBLISH_BRANCH="${PUBLISH_BRANCH:-dry-run-telemetry}"
 PUBLISH_OUTPUT_DIR="${PUBLISH_OUTPUT_DIR:-run_reports}"
+SHADOW_ACTIVE_OUTPUT_DIR="${SHADOW_ACTIVE_OUTPUT_DIR:-data/shadow_paper_trader_active_live}"
+SHADOW_HOLD_OUTPUT_DIR="${SHADOW_HOLD_OUTPUT_DIR:-data/shadow_paper_trader_hold_live}"
+SHADOW_TAKER_ACTIVE_OUTPUT_DIR="${SHADOW_TAKER_ACTIVE_OUTPUT_DIR:-data/shadow_paper_trader_taker_active_live}"
+SHADOW_TAKER_HOLD_OUTPUT_DIR="${SHADOW_TAKER_HOLD_OUTPUT_DIR:-data/shadow_paper_trader_taker_hold_live}"
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$repo_root" || exit 1
@@ -106,9 +110,12 @@ write_heartbeat() {
   local paper_exit="$7"
   local eval_exit="$8"
   local shadow_exit="$9"
-  local analysis_exit="${10}"
+  local shadow_hold_exit="${10}"
+  local taker_active_exit="${11}"
+  local taker_hold_exit="${12}"
+  local analysis_exit="${13}"
   "$python_bin" - "$heartbeat_path" "$RUN_NAME" "$$" "$cycle" "$cycle_start" "$cycle_end" "$sleep_seconds" \
-    "$market_exit" "$external_exit" "$paper_exit" "$eval_exit" "$shadow_exit" "$analysis_exit" <<'PY'
+    "$market_exit" "$external_exit" "$paper_exit" "$eval_exit" "$shadow_exit" "$shadow_hold_exit" "$taker_active_exit" "$taker_hold_exit" "$analysis_exit" <<'PY'
 import json
 import sys
 
@@ -125,6 +132,9 @@ import sys
     paper_exit,
     eval_exit,
     shadow_exit,
+    shadow_hold_exit,
+    taker_active_exit,
+    taker_hold_exit,
     analysis_exit,
 ) = sys.argv[1:]
 
@@ -133,7 +143,10 @@ exit_codes = {
     "external_fair_value_scan": int(external_exit),
     "market_making_paper": int(paper_exit),
     "reward_fair_value_evaluator": int(eval_exit),
-    "shadow_paper_trader": int(shadow_exit),
+    "shadow_paper_trader_active": int(shadow_exit),
+    "shadow_paper_trader_hold": int(shadow_hold_exit),
+    "shadow_paper_trader_taker_active": int(taker_active_exit),
+    "shadow_paper_trader_taker_hold": int(taker_hold_exit),
 }
 if int(analysis_exit) >= 0:
     exit_codes["shadow_action_analysis"] = int(analysis_exit)
@@ -152,7 +165,10 @@ payload = {
         "external_fair_value_history": "data/external_fair_value/candidate_history.csv",
         "maker_paper_report": "data/market_making_paper_live/report.json",
         "evaluator_report": "data/reward_fair_value_evaluator_live/report.json",
-        "shadow_paper_report": "data/shadow_paper_trader_live/report.json",
+        "shadow_paper_active_report": "data/shadow_paper_trader_active_live/report.json",
+        "shadow_paper_hold_report": "data/shadow_paper_trader_hold_live/report.json",
+        "shadow_paper_taker_active_report": "data/shadow_paper_trader_taker_active_live/report.json",
+        "shadow_paper_taker_hold_report": "data/shadow_paper_trader_taker_hold_live/report.json",
         "shadow_action_history": "data/reward_fair_value_evaluator_live/shadow_action_history.csv",
         "supervisor_log": f"data/{run_name}/supervisor.log",
     },
@@ -216,8 +232,14 @@ while true; do
   rotate_if_large "data/external_fair_value/candidate_history.csv" "$MAX_HISTORY_MB" | while read -r line; do log "$line"; done
   rotate_if_large "data/external_fair_value/scan_log.jsonl" "$MAX_HISTORY_MB" | while read -r line; do log "$line"; done
   rotate_if_large "data/reward_fair_value_evaluator_live/shadow_action_history.csv" "$MAX_HISTORY_MB" | while read -r line; do log "$line"; done
-  rotate_if_large "data/shadow_paper_trader_live/paper_orders.csv" "$MAX_HISTORY_MB" | while read -r line; do log "$line"; done
-  rotate_if_large "data/shadow_paper_trader_live/paper_order_events.csv" "$MAX_HISTORY_MB" | while read -r line; do log "$line"; done
+  rotate_if_large "${SHADOW_ACTIVE_OUTPUT_DIR}/paper_orders.csv" "$MAX_HISTORY_MB" | while read -r line; do log "$line"; done
+  rotate_if_large "${SHADOW_ACTIVE_OUTPUT_DIR}/paper_order_events.csv" "$MAX_HISTORY_MB" | while read -r line; do log "$line"; done
+  rotate_if_large "${SHADOW_HOLD_OUTPUT_DIR}/paper_orders.csv" "$MAX_HISTORY_MB" | while read -r line; do log "$line"; done
+  rotate_if_large "${SHADOW_HOLD_OUTPUT_DIR}/paper_order_events.csv" "$MAX_HISTORY_MB" | while read -r line; do log "$line"; done
+  rotate_if_large "${SHADOW_TAKER_ACTIVE_OUTPUT_DIR}/paper_orders.csv" "$MAX_HISTORY_MB" | while read -r line; do log "$line"; done
+  rotate_if_large "${SHADOW_TAKER_ACTIVE_OUTPUT_DIR}/paper_order_events.csv" "$MAX_HISTORY_MB" | while read -r line; do log "$line"; done
+  rotate_if_large "${SHADOW_TAKER_HOLD_OUTPUT_DIR}/paper_orders.csv" "$MAX_HISTORY_MB" | while read -r line; do log "$line"; done
+  rotate_if_large "${SHADOW_TAKER_HOLD_OUTPUT_DIR}/paper_order_events.csv" "$MAX_HISTORY_MB" | while read -r line; do log "$line"; done
   rotate_if_large "$supervisor_log" "32.0" | while read -r line; do log "$line"; done
 
   invoke_step "market_making_scan" \
@@ -262,12 +284,45 @@ while true; do
     --max-snapshot-age-hours "$MAX_SNAPSHOT_AGE_HOURS"
   eval_exit=$?
 
-  invoke_step "shadow_paper_trader" \
+  invoke_step "shadow_paper_trader_active" \
     research/shadow_paper_trader.py \
     --shadow-actions-csv data/reward_fair_value_evaluator_live/shadow_actions.csv \
     --maker-history-csv data/market_making/candidate_history.csv \
-    --output-dir data/shadow_paper_trader_live
+    --output-dir "$SHADOW_ACTIVE_OUTPUT_DIR"
   shadow_exit=$?
+
+  invoke_step "shadow_paper_trader_hold" \
+    research/shadow_paper_trader.py \
+    --shadow-actions-csv data/reward_fair_value_evaluator_live/shadow_actions.csv \
+    --maker-history-csv data/market_making/candidate_history.csv \
+    --output-dir "$SHADOW_HOLD_OUTPUT_DIR" \
+    --take-profit-per-share 999 \
+    --stop-loss-per-share 999 \
+    --max-position-cycles 1000000 \
+    --max-position-without-update-hours 999999 \
+    --disable-stale-position-close
+  shadow_hold_exit=$?
+
+  invoke_step "shadow_paper_trader_taker_active" \
+    research/shadow_paper_trader.py \
+    --shadow-actions-csv data/reward_fair_value_evaluator_live/shadow_actions.csv \
+    --maker-history-csv data/market_making/candidate_history.csv \
+    --output-dir "$SHADOW_TAKER_ACTIVE_OUTPUT_DIR" \
+    --directional-entry-mode taker
+  taker_active_exit=$?
+
+  invoke_step "shadow_paper_trader_taker_hold" \
+    research/shadow_paper_trader.py \
+    --shadow-actions-csv data/reward_fair_value_evaluator_live/shadow_actions.csv \
+    --maker-history-csv data/market_making/candidate_history.csv \
+    --output-dir "$SHADOW_TAKER_HOLD_OUTPUT_DIR" \
+    --directional-entry-mode taker \
+    --take-profit-per-share 999 \
+    --stop-loss-per-share 999 \
+    --max-position-cycles 1000000 \
+    --max-position-without-update-hours 999999 \
+    --disable-stale-position-close
+  taker_hold_exit=$?
 
   analysis_exit=-1
   if (( ANALYSIS_EVERY_CYCLES > 0 && cycle % ANALYSIS_EVERY_CYCLES == 0 )); then
@@ -289,7 +344,7 @@ while true; do
     sleep_seconds=5
   fi
   write_heartbeat "$cycle" "$cycle_start" "$cycle_end" "$sleep_seconds" \
-    "$market_exit" "$external_exit" "$paper_exit" "$eval_exit" "$shadow_exit" "$analysis_exit"
+    "$market_exit" "$external_exit" "$paper_exit" "$eval_exit" "$shadow_exit" "$shadow_hold_exit" "$taker_active_exit" "$taker_hold_exit" "$analysis_exit"
   log "cycle_done cycle=${cycle} elapsed_seconds=${elapsed} sleep_seconds=${sleep_seconds}"
 
   if (( STOP_AFTER_CYCLES > 0 && cycle >= STOP_AFTER_CYCLES )); then

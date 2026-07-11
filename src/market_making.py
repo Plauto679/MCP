@@ -28,6 +28,8 @@ class MarketMakingScanConfig:
     page_size: int = 100
     book_chunk_size: int = 50
     request_timeout_s: float = 12.0
+    request_attempts: int = 3
+    request_backoff_s: float = 1.0
     min_daily_rate: float = 10.0
     min_volume_24hr: float = 1000.0
     min_avg_spread: float = 0.002
@@ -126,13 +128,7 @@ def fetch_reward_markets(config: MarketMakingScanConfig) -> list[dict[str, Any]]
         }
         if next_cursor:
             params["next_cursor"] = next_cursor
-        response = requests.get(
-            f"{config.clob_base_url.rstrip('/')}/rewards/markets/multi",
-            params=params,
-            headers=HTTP_HEADERS,
-            timeout=float(config.request_timeout_s),
-        )
-        response.raise_for_status()
+        response = _get_reward_markets_page(config, params)
         payload = response.json()
         page = payload.get("data") if isinstance(payload, dict) else []
         if not isinstance(page, list) or not page:
@@ -151,6 +147,32 @@ def fetch_reward_markets(config: MarketMakingScanConfig) -> list[dict[str, Any]]
         if not next_cursor or next_cursor == LAST_CURSOR:
             break
     return markets
+
+
+def _get_reward_markets_page(config: MarketMakingScanConfig, params: dict[str, Any]) -> requests.Response:
+    attempts = max(int(config.request_attempts), 1)
+    url = f"{config.clob_base_url.rstrip('/')}/rewards/markets/multi"
+    last_error: Exception | None = None
+    for attempt in range(1, attempts + 1):
+        try:
+            response = requests.get(
+                url,
+                params=params,
+                headers=HTTP_HEADERS,
+                timeout=float(config.request_timeout_s),
+            )
+            if response.status_code < 500 and response.status_code != 429:
+                response.raise_for_status()
+                return response
+            response.raise_for_status()
+        except requests.RequestException as exc:
+            last_error = exc
+            if attempt >= attempts:
+                raise
+            time.sleep(max(float(config.request_backoff_s), 0.0) * attempt)
+    if last_error:
+        raise last_error
+    raise RuntimeError("reward markets request failed without an exception")
 
 
 def evaluate_reward_market(

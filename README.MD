@@ -24,6 +24,8 @@ This runs the current dry strategy stack:
 - Fed rates fair-value proxy;
 - filtered maker-only dry quotes;
 - Fed-rate directional dry simulation;
+- parallel active-exit and long-hold dry ledgers;
+- taker diagnostic dry ledgers for model validation only;
 - sanitized GitHub telemetry under `run_reports/`.
 
 Hard constraints:
@@ -39,6 +41,8 @@ Current focus:
 - Fed rates fair-value proxy using FRED/Yahoo futures or optional manual FedWatch probabilities.
 - Maker-only dry quotes filtered to avoid fast sports/esports/unmodelled markets.
 - Directional dry positions for Fed-rate edges.
+- Active-exit vs long-hold comparison to test whether stops are helping or cutting reversals too early.
+- Taker diagnostic ledgers to evaluate directional fair-value signals even when maker quotes do not fill.
 - Long-running dry collection with heartbeat, logs, and CSV rotation.
 
 ## Safety
@@ -88,9 +92,12 @@ This publishes small sanitized summaries under `run_reports/`; it does not publi
 - `data/reward_fair_value_dry_live/heartbeat.json`
 - `data/reward_fair_value_dry_live/supervisor.log`
 - `data/reward_fair_value_evaluator_live/report.json`
-- `data/shadow_paper_trader_live/report.json`
-- `data/shadow_paper_trader_live/paper_orders.csv`
-- `data/shadow_paper_trader_live/paper_position_events.csv`
+- `data/shadow_paper_trader_active_live/report.json`
+- `data/shadow_paper_trader_active_live/paper_orders.csv`
+- `data/shadow_paper_trader_hold_live/report.json`
+- `data/shadow_paper_trader_hold_live/paper_orders.csv`
+- `data/shadow_paper_trader_taker_active_live/report.json`
+- `data/shadow_paper_trader_taker_hold_live/report.json`
 - `run_reports/latest_summary.md` if telemetry publishing is enabled
 
 The `data/` directory is ignored by git.

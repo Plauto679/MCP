@@ -18,7 +18,7 @@ Do not run:
 - wallet-authenticated order placement;
 - unrelated dashboard/server commands unless explicitly requested.
 
-The active experiment is the reward/fair-value dry stack focused on Fed rates, filtered maker-only quotes, and Fed-rate directional dry simulation.
+The active experiment is the reward/fair-value dry stack focused on Fed rates, filtered maker-only quotes, Fed-rate directional dry simulation, active-exit versus long-hold ledger comparison, and taker diagnostic dry ledgers for model validation only.
 
 ## Setup
 
@@ -116,9 +116,12 @@ Primary files:
 
 - `run_reports/latest_summary.md` if GitHub publishing is enabled
 - `run_reports/latest_summary.json` if GitHub publishing is enabled
-- `data/shadow_paper_trader_live/report.json`
-- `data/shadow_paper_trader_live/paper_orders.csv`
-- `data/shadow_paper_trader_live/paper_position_events.csv`
+- `data/shadow_paper_trader_active_live/report.json`
+- `data/shadow_paper_trader_active_live/paper_orders.csv`
+- `data/shadow_paper_trader_hold_live/report.json`
+- `data/shadow_paper_trader_hold_live/paper_orders.csv`
+- `data/shadow_paper_trader_taker_active_live/report.json`
+- `data/shadow_paper_trader_taker_hold_live/report.json`
 - `data/reward_fair_value_evaluator_live/latest_external_fair_value.csv`
 - `data/reward_fair_value_evaluator_live/latest_maker_economics.csv`
 - `data/shadow_action_analysis_live/shadow_action_summary.csv`
@@ -126,6 +129,8 @@ Primary files:
 Key metrics:
 
 - Active realized PnL and unrealized PnL, excluding reward proxy.
+- Active-exit PnL versus long-hold mark-to-mid PnL.
+- Taker diagnostic PnL to evaluate fair-value direction independent of maker fill rate.
 - Take-profit vs stop-loss vs stale/max-hold exits.
 - Fed rates directional dry positions versus maker-only Fed quotes.
 - Conservative reward proxy needed to break even.
