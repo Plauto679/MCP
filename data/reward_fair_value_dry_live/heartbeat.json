@@ -1,0 +1,31 @@
+{
+  "run_name": "reward_fair_value_dry_live",
+  "mode": "dry_research_only",
+  "pid": 87646,
+  "cycle": 589,
+  "cycle_start": "2026-07-16T15:19:47Z",
+  "cycle_end": "2026-07-16T15:19:52Z",
+  "next_cycle_after_seconds": 595,
+  "exit_codes": {
+    "market_making_scan": 1,
+    "external_fair_value_scan": 1,
+    "market_making_paper": 0,
+    "reward_fair_value_evaluator": 0,
+    "shadow_paper_trader_active": 0,
+    "shadow_paper_trader_hold": 0,
+    "shadow_paper_trader_taker_active": 0,
+    "shadow_paper_trader_taker_hold": 0
+  },
+  "outputs": {
+    "market_making_history": "data/market_making/candidate_history.csv",
+    "external_fair_value_history": "data/external_fair_value/candidate_history.csv",
+    "maker_paper_report": "data/market_making_paper_live/report.json",
+    "evaluator_report": "data/reward_fair_value_evaluator_live/report.json",
+    "shadow_paper_active_report": "data/shadow_paper_trader_active_live/report.json",
+    "shadow_paper_hold_report": "data/shadow_paper_trader_hold_live/report.json",
+    "shadow_paper_taker_active_report": "data/shadow_paper_trader_taker_active_live/report.json",
+    "shadow_paper_taker_hold_report": "data/shadow_paper_trader_taker_hold_live/report.json",
+    "shadow_action_history": "data/reward_fair_value_evaluator_live/shadow_action_history.csv",
+    "supervisor_log": "data/reward_fair_value_dry_live/supervisor.log"
+  }
+}

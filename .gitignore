@@ -9,5 +9,6 @@ __pycache__/
 .DS_Store
 *.log
 run*.log
-data/
+# data/
+data/local_backups/
 run_reports/

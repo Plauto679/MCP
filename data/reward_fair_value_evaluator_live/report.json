@@ -1,0 +1,51 @@
+{
+  "run_ts_utc": "2026-07-16T15:19:51.685945+00:00",
+  "mode": "dry_research_only",
+  "maker_history_csv": "data/market_making/candidate_history.csv",
+  "external_history_csv": "data/external_fair_value/candidate_history.csv",
+  "maker_paper_events_csv": "data/market_making_paper_live/maker_paper_events.csv",
+  "maker_markets_total": 0,
+  "external_markets_total": 0,
+  "maker_markets": 0,
+  "external_markets": 0,
+  "max_snapshot_age_hours": 24.0,
+  "wti_context": {
+    "symbol": "CL=F",
+    "price": 79.55,
+    "source": "yahoo_chart",
+    "range": "3mo",
+    "interval": "1d",
+    "observations": 63,
+    "annual_volatility": 0.601501,
+    "exchange_timezone": "America/New_York",
+    "regular_market_time": 1784214589,
+    "volatility_source": "yahoo_3mo_realized"
+  },
+  "fed_context": {
+    "source": "no_fed_rate_rows",
+    "current_effr": 3.625,
+    "current_effr_source": "fallback",
+    "futures": {},
+    "manual_probabilities": []
+  },
+  "history_stats_keys": 0,
+  "top_maker": [],
+  "top_external": [],
+  "top_combined": [],
+  "top_shadow_actions": [],
+  "caveats": [
+    "This is a research evaluator, not a live trading strategy.",
+    "Liquidity rewards are estimated from visible score proxies and market_competitiveness.",
+    "Maker rebates are estimated from fee-equivalent formulas and do not include wallet-specific official payouts.",
+    "External fair value probabilities are rough proxies except where a family-specific model is explicitly available.",
+    "Fed rates probabilities use official/manual FedWatch inputs if supplied; otherwise they use a FRED/Yahoo futures proxy."
+  ],
+  "outputs": {
+    "maker_economics": "data/reward_fair_value_evaluator_live/latest_maker_economics.csv",
+    "external_fair_value": "data/reward_fair_value_evaluator_live/latest_external_fair_value.csv",
+    "combined_watchlist": "data/reward_fair_value_evaluator_live/combined_watchlist.csv",
+    "shadow_actions": "data/reward_fair_value_evaluator_live/shadow_actions.csv",
+    "shadow_action_history": "data/reward_fair_value_evaluator_live/shadow_action_history.csv",
+    "report": "data/reward_fair_value_evaluator_live/report.json"
+  }
+}

@@ -1,0 +1,41 @@
+{
+  "run_ts_utc": "2026-07-16T15:19:51.602429+00:00",
+  "mode": "dry_research_only",
+  "history_csv": "data/market_making/candidate_history.csv",
+  "rows_read": 0,
+  "markets": 0,
+  "horizon_scans": 1,
+  "quote_events": 0,
+  "overall": {
+    "quote_events": 0,
+    "fills_by_next_snapshot": 0,
+    "fill_rate": 0.0,
+    "mark_to_mid_pnl_usd": 0.0,
+    "avg_mark_to_mid_pnl_usd": 0.0,
+    "avg_pnl_per_filled_quote_usd": 0.0,
+    "reward_proxy_aggressive_usd": 0.0,
+    "avg_reward_proxy_aggressive_usd": 0.0,
+    "reward_proxy_conservative_usd": 0.0,
+    "avg_reward_proxy_conservative_usd": 0.0,
+    "net_pnl_aggressive_reward_usd": 0.0,
+    "avg_net_pnl_aggressive_reward_usd": 0.0,
+    "net_pnl_conservative_reward_usd": 0.0,
+    "avg_net_pnl_conservative_reward_usd": 0.0,
+    "aggressive_reward_fraction_needed_to_break_even": "",
+    "conservative_reward_fraction_needed_to_break_even": ""
+  },
+  "top_markets_conservative_reward": [],
+  "worst_markets_mark_to_mid": [],
+  "side_summary": [],
+  "caveats": [
+    "Snapshot-only fill model: a quote is counted as filled only when the next sampled book crosses or touches it.",
+    "Rewards are proxies using daily_rate, quote score, and market_competitiveness; they are not official reward accounting.",
+    "Ask-side quotes assume inventory or a separate inventory plan; this simulator does not model wallet constraints."
+  ],
+  "outputs": {
+    "events": "data/market_making_paper_live/maker_paper_events.csv",
+    "side_summary": "data/market_making_paper_live/maker_paper_side_summary.csv",
+    "market_summary": "data/market_making_paper_live/maker_paper_market_summary.csv",
+    "report": "data/market_making_paper_live/report.json"
+  }
+}

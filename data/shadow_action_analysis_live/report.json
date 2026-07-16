@@ -1,0 +1,12 @@
+{
+  "run_ts_utc": "2026-07-16T15:09:51.680621+00:00",
+  "mode": "dry_research_only",
+  "history_csv": "data/reward_fair_value_evaluator_live/shadow_action_history.csv",
+  "rows_read": 0,
+  "groups": 0,
+  "top_stable_actions": [],
+  "outputs": {
+    "summary": "data/shadow_action_analysis_live/shadow_action_summary.csv",
+    "report": "data/shadow_action_analysis_live/report.json"
+  }
+}
